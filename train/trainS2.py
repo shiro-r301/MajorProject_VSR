@@ -32,7 +32,7 @@ MEMORY NOTE: the VAE decoder runs WITH grad. Decoding many frames at 320x640
 with activations retained is expensive; if you OOM, reduce --num_frames or
 --crop_size, or try --enable_slicing.
 """
-from ..patchTransformer import patch_CogVideoXTransformer3DModel
+from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 patch_CogVideoXTransformer3DModel()
 
 from __future__ import annotations
@@ -54,8 +54,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import set_seed
 
-from ..dataloading.VideoFileLoader import VideoFileSRDataset
-from ..inference_func.inference import DOVEInferenceFn
+from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
+from MajorProject_VSR.inference_func.inference import DOVEInferenceFn
 from train import log_memory, log_tensor_stats, prepare_rotary_positional_embeddings, spatial_upsample_video
 from contextlib import nullcontext
 
@@ -75,7 +75,7 @@ import decord  # isort:skip
 decord.bridge.set_bridge("torch")
 
 try:
-    from ..evaluation.validation import validation_pred
+    from MajorProject_VSR.evaluation.validation import validation_pred
 except ImportError:  # pragma: no cover
     validation_pred = None
 

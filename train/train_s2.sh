@@ -7,7 +7,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Model Configuration
 MODEL_ARGS=(
-    --model_path "THUDM/CogVideoX1.5-5B"
+    --model_path "/home/jl_fs/DOVE/pretrained_models/DOVE"
     --dtype "bfloat16"  # ["float16", "bfloat16", "float32"]
     --gradient_checkpointing
     --init_from "checkpoint/DOVE-s1"  # Stage-1 checkpoint dir to initialise from

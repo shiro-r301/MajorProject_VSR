@@ -1,7 +1,8 @@
 from pathlib import Path
 import argparse
 import logging
-
+import gc
+import psutil
 import torch
 from torchvision import transforms
 from torchvision.io import write_video
@@ -12,7 +13,7 @@ from diffusers import (
     CogVideoXPipeline,
 )
 
-from patchTransformer import patch_CogVideoXTransformer3DModel
+from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 from transformers import set_seed
 from typing import Dict, Tuple
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
@@ -436,6 +437,27 @@ def get_valid_tile_region(t_start, t_end, h_start, h_end, w_start, w_end,
         "out_w_start": out_w_start, "out_w_end": out_w_end,
     }
 
+def log_memory(tag: str, device: int | None = None):
+    lines = [f"[{tag}]"]
+    if torch.cuda.is_available():
+        dev = device if device is not None else torch.cuda.current_device()
+        torch.cuda.synchronize(dev)
+        free, total = torch.cuda.mem_get_info(dev)  # device-wide, from the driver
+        gib = 1024 ** 3
+        lines.append(
+            f"  GPU{dev}: allocated={torch.cuda.memory_allocated(dev)/gib:.2f} GiB | "
+            f"reserved={torch.cuda.memory_reserved(dev)/gib:.2f} GiB | "
+            f"used(device)={(total-free)/gib:.2f} GiB | "
+            f"free(device)={free/gib:.2f} GiB | total={total/gib:.2f} GiB"
+        )
+    vm = psutil.virtual_memory()
+    rss = psutil.Process().memory_info().rss
+    lines.append(
+        f"  CPU: process RSS={rss/gib:.2f} GiB | "
+        f"system used={vm.used/gib:.2f} GiB | available={vm.available/gib:.2f} GiB"
+    )
+    print("\n".join(lines))
+
 
 def prepare_rotary_positional_embeddings(
     height: int,
@@ -618,6 +640,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--save_format", type=str, default="yuv444p", help="Save output as PNG sequence")
 
+    p.add_argument("--drop_ratio", type=float, default=0.35)
+    p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
+
     # Crop and Tiling Parameters
     parser.add_argument("--tile_size_hw", type=int, nargs=2, default=(0, 0), help="Tile size for spatial tiling (height, width)")
 
@@ -636,6 +661,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--token_save_path", type=str, default=None,
                          help="Root directory to save captured tokens. Defaults to <output_path>/token_dumps")
+
+    parser.add_argument("--init_from", type=str, default=None, help="Path to full custom transformer.pt weights")
 
     args = parser.parse_args()
 
@@ -664,7 +691,7 @@ if __name__ == "__main__":
 
     # Load empty prompt embedding if exists
     empty_prompt_embedding = None
-    empty_prompt_path = Path("pretrained_models/prompt_embeddings/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors")
+    empty_prompt_path = Path("/home/jl_fs/DOVE/pretrained_models/prompt_embeddings/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors")
     if empty_prompt_path.exists():
         try:
             empty_prompt_embedding = load_file(str(empty_prompt_path))["prompt_embedding"]
@@ -697,7 +724,8 @@ if __name__ == "__main__":
     # function to use Multi GPUs.
 
     patch_CogVideoXTransformer3DModel()
-    pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
+    print(f"Loading model with type: {dtype}")
+    pipe = CogVideoXPipeline.from_pretrained(args.model_path, dtype=dtype, tokenizer=None, text_encoder=None)
 
     # If you're using with lora, add this code
     if args.lora_path:
@@ -706,6 +734,24 @@ if __name__ == "__main__":
             args.lora_path, weight_name="pytorch_lora_weights.safetensors", adapter_name="test_1"
         )
         pipe.fuse_lora(components=["transformer"], lora_scale=1.0) # lora_scale = lora_alpha / rank
+    
+    if args.init_from:
+        print(f"🚀 Loading FULL custom transformer weights from: {args.init_from}")
+        # Load state dict to CPU first to avoid GPU OOM during loading
+        state_dict = torch.load(args.init_from, map_location="cpu")
+        
+        # Optional: Clean up keys if they were saved with a 'module.' prefix (common in DDP)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("module.", "") if k.startswith("module.") else k
+            new_state_dict[new_key] = v
+        
+        # Load into the transformer
+        pipe.transformer.load_state_dict(new_state_dict, strict=True)
+        print("✅ Full custom transformer weights loaded successfully.")
+
+        del state_dict, new_state_dict
+        gc.collect()
 
     # 2. Set Scheduler.
     # Can be changed to `CogVideoXDPMScheduler` or `CogVideoXDDIMScheduler`.
@@ -759,6 +805,7 @@ if __name__ == "__main__":
         metric_accumulator = None
     
     for video_path in tqdm(video_files, desc="Processing videos"):
+        log_memory("init_from")
         video_name = os.path.basename(video_path)
         video_stem = os.path.splitext(video_name)[0]
         prompt = video_prompt_dict.get(video_name, "")

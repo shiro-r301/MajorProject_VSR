@@ -13,7 +13,7 @@ Layout
 8. CLI + entry point
 """
 
-from ..patchTransformer import patch_CogVideoXTransformer3DModel
+from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 patch_CogVideoXTransformer3DModel()
 
 from __future__ import annotations
