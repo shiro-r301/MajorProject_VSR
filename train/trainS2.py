@@ -645,8 +645,8 @@ def run_periodic_validation(
         sr_noise_step=args.sr_noise_step,
         empty_prompt_embedding=empty_prompt_embedding,
     )   
-    pipe.transformer.eval()
 
+    pipe.transformer.eval()
     eval_metrics = [m.strip().lower() for m in args.val_metrics.split(",") if m.strip()]
     pred_dir = os.path.join(args.output_dir, "val_preds", f"step_{global_step}")
 
