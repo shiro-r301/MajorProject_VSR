@@ -1,76 +1,27 @@
-# Copyright 2025 The CogVideoX team, Tsinghua University & ZhipuAI and The HuggingFace Team.
-# All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# ============================================================================
-# TRaM-VSR CHANGES (on top of the reference TCG merger/unmerger):
-#
-#   1. TemporalCurvatureGuidance.temporal_group_tokens()
-#      New method implementing "pure temporal grouping": instead of taking
-#      the flat set of dropped tokens (Dr) and splitting it into arbitrary
-#      contiguous chunks (mean_global_tokens), we group dropped tokens by
-#      their *spatial position* and average only across the temporal
-#      (frame) axis at that position. Positions with no dropped frames
-#      contribute nothing (they stay represented individually in H_local).
-#      This keeps each global/summary token semantically tied to a single
-#      spatial location instead of mixing unrelated spatial content.
-#
-#   2. TemporalCurvatureGuidance.get_rope_for_temporal_groups()
-#      RoPE companion to (1): since temporal groups are irregular
-#      (variable-size, non-contiguous index sets defined by pos_indices),
-#      we can't reuse the reference's contiguous torch.split-based RoPE
-#      averaging (get_rope_for_merged_tokens). This gathers cos/sin at the
-#      exact original indices belonging to each group before averaging
-#      and re-normalizing.
-#
-#   3. TemporalCurvatureGuidance.__init__ gains `use_temporal_grouping`
-#      (default True) so the reference path (mean_global_tokens +
-#      get_rope_for_merged_tokens) is still selectable for A/B comparison
-#      against the baseline. Same flag threaded through
-#      CogVideoXTransformer3DModel.__init__.
-#
-#   4. Bug fix: forward() previously did `self.tcg = TemporalCurvatureGuidance()`
-#      unconditionally on every call, silently discarding the `patch_size_t`
-#      (and now `use_temporal_grouping`) configured in __init__ and resetting
-#      it to defaults on every forward pass. Removed; self.tcg from __init__
-#      is reused as-is.
-#
-#   identity_restore() is unchanged: it only ever restores kept (H_local)
-#   tokens into their original positions and leaves dropped positions equal
-#   to the original, pre-merge tokens, regardless of how the discarded
-#   global/summary tokens were computed.
-# ============================================================================
-
-from typing import Any
+import logging
+import sys
 import time
+from math import floor
+from typing import Any
+
 import torch
 from torch import nn
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import PeftAdapterMixin
-from ...utils import apply_lora_scale, logging
-from ...utils.torch_utils import maybe_allow_in_graph
-from ..attention import Attention, AttentionMixin, FeedForward
-from ..attention_processor import CogVideoXAttnProcessor2_0, FusedCogVideoXAttnProcessor2_0
-from ..cache_utils import CacheMixin
-from ..embeddings import CogVideoXPatchEmbed, TimestepEmbedding, Timesteps
-from ..modeling_outputs import Transformer2DModelOutput
-from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNorm, CogVideoXLayerNormZero
+# --- CHANGED: Absolute imports from diffusers instead of relative imports ---
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.loaders import PeftAdapterMixin
+from diffusers.utils import apply_lora_scale
+from diffusers.utils.torch_utils import maybe_allow_in_graph
+from diffusers.models.attention import Attention, AttentionMixin, FeedForward
+from diffusers.models.attention_processor import CogVideoXAttnProcessor2_0, FusedCogVideoXAttnProcessor2_0
+from diffusers.models.cache_utils import CacheMixin
+from diffusers.models.embeddings import CogVideoXPatchEmbed, TimestepEmbedding, Timesteps
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
+from diffusers.utils.logging import get_logger
 
-
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger = get_logger(__name__)
 
 from math import floor
 

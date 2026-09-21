@@ -12,6 +12,7 @@ from diffusers import (
     CogVideoXPipeline,
 )
 
+from patchTransformer import patch_CogVideoXTransformer3DModel
 from transformers import set_seed
 from typing import Dict, Tuple
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
@@ -695,6 +696,7 @@ if __name__ == "__main__":
     # add device_map="balanced" in the from_pretrained function and remove the enable_model_cpu_offload()
     # function to use Multi GPUs.
 
+    patch_CogVideoXTransformer3DModel()
     pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
 
     # If you're using with lora, add this code
