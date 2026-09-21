@@ -900,6 +900,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable_slicing", action="store_true")
     p.add_argument("--enable_tiling", action="store_true")
 
+    p.add_argument("--drop_ratio", type=float, default=0.35)
+    p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
+
     # Checkpointing / logging
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--log_steps", type=int, default=10)
