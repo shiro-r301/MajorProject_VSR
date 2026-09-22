@@ -1,42 +1,46 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 # Prevent tokenizer parallelism issues
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Setup project paths (matches inference script structure)
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_PARENT="$(dirname "$PROJECT_ROOT")"
+
+cd "$PROJECT_PARENT"
+
 # Model Configuration
 MODEL_ARGS=(
     --model_path "/home/jl_fs/DOVE/pretrained_models/DOVE"
-    --dtype "bfloat16"  # ["float16", "bfloat16", "float32"]
+    --dtype "bfloat16"
     --gradient_checkpointing
-    --init_from "checkpoint/DOVE-s1"  # Stage-1 checkpoint dir to initialise from
-    --empty_prompt_embedding "pretrained_models/prompt_embeddings/empty_prompt.safetensors"
+    --init_from "/home/jl_fs/DOVE/checkpoints"
+    --empty_prompt_embedding "/home/jl_fs/DOVE/pretrained_models/prompt_embeddings/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors"
     --enable_slicing
     --enable_tiling
 )
 
 # LoRA Configuration (leave empty for full fine-tuning)
 LORA_ARGS=(
-    # --use_lora
-    # --lora_rank 64
-    # --lora_alpha 64
-    # --target_modules "to_q" "to_k" "to_v" "to_out.0"
-    # --fp32_master_weights
-    # --no_fp32_master_weights  # Uncomment to disable fp32 master weights
+    --use_lora
+    --lora_rank 512
+    --lora_alpha 512
+    --target_modules "to_q" "to_k" "to_v" "to_out.0"
+    --fp32_master_weights
 )
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "checkpoint/DOVE-s2"
+    --output_dir "/home/jl_fs/MajorProject_VSR/checkpoints/part2/stage_2"
 )
 
 # Data Configuration
 DATA_ARGS=(
-    --video_dir "../datasets/train"
-    # --prompt_json "prompts.json"
-    --num_frames 9  # Clip length; must satisfy (F-1) % 8 == 0 (e.g., 9, 17, 25)
-    --crop_size 320 640  # HR crop size (height width)
+    --video_dir "/home/jl_fs/train_test_dataset/HQ-VSR"
+    --num_frames 7
+    --crop_size 320 640
     --upscale 4
     --num_workers 8
 )
@@ -55,9 +59,9 @@ SR_ARGS=(
     --noise_step 0
 )
 
-# Loss Weights Configuration (first perceptual weight > 0 wins)
+# Loss Weights Configuration
 LOSS_ARGS=(
-    --ea_dists_weight 1.0   # Edge-aware DISTS (paper's default)
+    --ea_dists_weight 1.0
     --dists_weight 0.0
     --ea_lpips_weight 0.0
     --lpips_weight 0.0
@@ -66,33 +70,34 @@ LOSS_ARGS=(
 
 # Training / Optimisation Configuration
 TRAIN_ARGS=(
-    --max_train_steps 500   # Optimizer steps (paper: 500)
+    --max_train_steps 500
     --seed 42
-    --batch_size 1          # Kept at 1 for video VRAM constraints
-    --gradient_accumulation_steps 1
-    --learning_rate 5e-6    # Default from argparse
+    --batch_size 1
+    --gradient_accumulation_steps 2
+    --learning_rate 7e-6
     --max_grad_norm 1.0
 )
 
 # Checkpointing / Logging Configuration
 CHECKPOINT_ARGS=(
     --save_steps 100
-    --log_steps 10
-    --log_level "INFO"      # ["DEBUG", "INFO", "WARNING"]; DEBUG adds per-tensor stats (slower)
-    --param_report "summary" # ["none", "summary", "detailed"]
+    --log_steps 2
+    --log_level "INFO"
+    --param_report "summary"
 )
 
-# Periodic Validation Configuration (skipped unless both dirs are set)
+# Periodic Validation Configuration
 VALIDATION_ARGS=(
-    # --val_lr_dir "../datasets/val_lr"
-    # --val_gt_dir "../datasets/val_gt"
+    --val_lr_dir "/home/jl_fs/train_test_dataset/UDM10/LQ-Video"
+    --val_gt_dir "/home/jl_fs/train_test_dataset/UDM10/GT-Video"
     --val_metrics "psnr,ssim,lpips,dists"
-    --val_steps 100         # Validate every N optimizer steps (0 disables)
+    --val_steps 100
     --val_fps 8
 )
 
 # Combine all arguments and launch training
-python train_stage2.py \
+# Note: If train_stage2.py is in the root directory, change the line below to: python train_stage2.py \
+python -m MajorProject_VSR.train.trainS2 \
     "${MODEL_ARGS[@]}" \
     "${LORA_ARGS[@]}" \
     "${OUTPUT_ARGS[@]}" \

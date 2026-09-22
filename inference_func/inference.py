@@ -44,13 +44,13 @@ import torch.nn.functional as F
 from diffusers import CogVideoXDPMScheduler, CogVideoXPipeline
 from safetensors.torch import load_file
 
-from dove_inference import (
+from MajorProject_VSR.inference_func.dove_inference import (
     get_valid_tile_region,
     make_spatial_tiles,
     make_temporal_chunks,
     process_video,
 )
-from patchTransformer import patch_CogVideoXTransformer3DModel
+from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 
 logger = logging.getLogger("dove_inference_fn")
 

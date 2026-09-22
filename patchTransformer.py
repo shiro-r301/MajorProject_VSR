@@ -1,4 +1,5 @@
 import diffusers
+import diffusers.models.transformers.cogvideox_transformer_3d
 from MajorProject_VSR.temporal_cogvideox_transformer_3d_batch_proccessing import CogVideoXTransformer3DModel, TemporalCurvatureGuidance
 
 def patch_CogVideoXTransformer3DModel():

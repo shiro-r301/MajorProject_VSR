@@ -13,10 +13,10 @@ Layout
 8. CLI + entry point
 """
 
+from __future__ import annotations
+
 from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 patch_CogVideoXTransformer3DModel()
-
-from __future__ import annotations
 
 import argparse
 import logging
@@ -35,7 +35,7 @@ from tqdm import tqdm
 from transformers import set_seed
 
 import decord  # isort:skip
-from dataloading.VideoFileLoader import VideoFileSRDataset
+from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
 
 decord.bridge.set_bridge("torch")  # dataset loader expects torch tensors from decord
 

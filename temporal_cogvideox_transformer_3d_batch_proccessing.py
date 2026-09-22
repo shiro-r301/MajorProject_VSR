@@ -32,7 +32,7 @@ import sys
 
 def setup_tcg_logging(log_file="tcg_execution.log"):
     logger = logging.getLogger("TCG_Logger")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.WARNING)
 
     # Prevent adding handlers multiple times if re-run in Jupyter/interactive shells
     if not logger.handlers:
@@ -40,7 +40,7 @@ def setup_tcg_logging(log_file="tcg_execution.log"):
 
         # 1. Console Handler (Standard Output)
         ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.INFO)
+        ch.setLevel(logging.WARNING)
         ch.setFormatter(formatter)
 
         # 2. File Handler (Text File)
@@ -106,7 +106,7 @@ class TemporalCurvatureGuidance(torch.nn.Module):
         B, P, C = X.shape
         tcg_logger.info(f"[Scoring] Input shape: {X.shape} | Frames: {self.Fg} | Patch_t: {self.p_t}")
 
-        Xf = X.reshape([B, self.Fg, self.Wg * self.Hg, C])
+        Xf = X.reshape([B, self.Fg, self.Wg * self.Hg, C]).to(dtype=torch.float32)
         velocity = Xf[:, 1:, :, :] - Xf[:, :-1, :, :]
         v_norms = velocity.norm(dim=-1)
         vf_n = velocity[:, 1:, :, :]
@@ -122,7 +122,7 @@ class TemporalCurvatureGuidance(torch.nn.Module):
         s_max = pad_curv.amax(dim=-1, keepdim=True)
         s_tcg = (pad_curv - s_min) / (s_max - s_min + self.ep)
 
-        tcg_logger.info(f"[Scoring] Curvature Min: {s_min.mean().item():.4f} | Max: {s_max.mean().item():.4f}")
+        tcg_logger.info(f"[Scoring] Curvature Min: {s_min.shape}, {s_min.dtype}, {Xf.shape}, {pad_curv.shape} | Max: {s_max.mean().item():.4f}")
         return s_tcg
 
     def fill_edges(self, curvature):
@@ -466,10 +466,10 @@ class TemporalCurvatureGuidance(torch.nn.Module):
         positions.
         """
         B, N, D = original_tokens.shape
-        restored = original_tokens.clone()
-        important_updated = merged_tokens[:, :k, :]
-        restored.scatter_(1, kept_idx.unsqueeze(-1).expand(-1, -1, D), important_updated)
+        idx = kept_idx.unsqueeze(-1).expand(-1, -1, D)
+        src = merged_tokens[:, :k, :].to(dtype=original_tokens.dtype)
 
+        restored = torch.scatter(original_tokens, 1, idx, src)   # new tensor, autograd-safe
         tcg_logger.info(f"[Restore] Restored sequence length to {N} for batch {B}. Kept tokens updated.")
         return restored
 
@@ -790,7 +790,7 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
         patch_bias: bool = True,
         merger_layers: list[int] | None = None,
         unmerger_layers: list[int] | None = None,
-        use_temporal_grouping: bool = False,
+        use_temporal_grouping: bool = True,
     ):
         super().__init__()
 

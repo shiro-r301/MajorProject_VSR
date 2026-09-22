@@ -17,7 +17,7 @@ except ImportError:
 
 from torch.utils.data import Dataset, DataLoader
 import torch
-from torch import F
+from torch.nn import functional as F
 
 import cv2
 
@@ -117,8 +117,9 @@ class VideoFileSRDataset(Dataset):
     DEFAULT_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
 
     def __init__(self, video_dir: str, num_frames: int = 25, hr_crop_size: Tuple[int, int] = (320, 640),
-                 scale: int = 4, is_train: bool = True, video_extensions: Optional[Tuple[str, ...]] = None,
-                 degradation_kwargs: Optional[dict] = None, prompt_json: Optional[str] = None):
+                 logger=logging.Logger, scale: int = 4, is_train: bool = True, video_extensions: Optional[Tuple[str, ...]] = None,
+                 degradation_kwargs: Optional[dict] = None, prompt_json: Optional[str] = None, ):
+
         super().__init__()
         self.video_dir = video_dir
         self.num_frames = num_frames
@@ -126,7 +127,7 @@ class VideoFileSRDataset(Dataset):
         self.scale = scale
         self.is_train = is_train
         self.video_extensions = tuple(e.lower() for e in (video_extensions or self.DEFAULT_VIDEO_EXTS))
-
+        self.logger = logger
         self.video_paths = sorted([
             os.path.join(video_dir, f) for f in os.listdir(video_dir)
             if f.lower().endswith(self.video_extensions)
@@ -136,6 +137,7 @@ class VideoFileSRDataset(Dataset):
 
         degradation_kwargs = dict(degradation_kwargs or {})
         degradation_kwargs.setdefault('scale', scale)
+        degradation_kwargs.setdefault('logger', logger)
         self.degrade = RealWorldDegradation(**degradation_kwargs)
         
         self.prompts = {}

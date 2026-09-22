@@ -32,10 +32,11 @@ MEMORY NOTE: the VAE decoder runs WITH grad. Decoding many frames at 320x640
 with activations retained is expensive; if you OOM, reduce --num_frames or
 --crop_size, or try --enable_slicing.
 """
+from __future__ import annotations
+
+
 from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 patch_CogVideoXTransformer3DModel()
-
-from __future__ import annotations
 
 import argparse
 import importlib
@@ -44,7 +45,9 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import gc
 
+from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,8 +59,11 @@ from transformers import set_seed
 
 from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
 from MajorProject_VSR.inference_func.inference import DOVEInferenceFn
-from train import log_memory, log_tensor_stats, prepare_rotary_positional_embeddings, spatial_upsample_video
+from MajorProject_VSR.inference_func.dove_inference import log_memory
+from MajorProject_VSR.train.train import log_tensor_stats, prepare_rotary_positional_embeddings, spatial_upsample_video
 from contextlib import nullcontext
+
+torch.autograd.set_detect_anomaly(True)
 
 try:
     from diffusers.training_utils import cast_training_params
@@ -74,10 +80,7 @@ import decord  # isort:skip
 
 decord.bridge.set_bridge("torch")
 
-try:
-    from MajorProject_VSR.evaluation.validation import validation_pred
-except ImportError:  # pragma: no cover
-    validation_pred = None
+from MajorProject_VSR.evaluation.validation import validation_pred
 
 logger = logging.getLogger("tram_vsr_stage2")
 
@@ -122,18 +125,18 @@ def setup_logging(output_dir: str, level: str) -> None:
     """Console shows INFO+; the log file receives everything the logger level allows."""
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    console.setFormatter(fmt)
+    # console = logging.StreamHandler()
+    # console.setLevel(logging.INFO)
+    # console.setFormatter(fmt)
 
-    file_handler = logging.FileHandler(os.path.join(output_dir, "train_debug.log"))
+    file_handler = logging.FileHandler(os.path.join(output_dir, "train_debug.log"), mode='w', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(fmt)
 
     for name in SHARED_LOGGER_NAMES:
         lg = logging.getLogger(name)
         lg.handlers.clear()
-        lg.addHandler(console)
+        # lg.addHandler(console)
         lg.addHandler(file_handler)
         lg.setLevel(getattr(logging, level))
         lg.propagate = False
@@ -204,7 +207,9 @@ def decode_frames_independently(vae, latent: torch.Tensor, scaling_factor: float
     Grad ALWAYS flows here: the decoder is on the loss path even though frozen.
     """
     latent = latent.permute(0, 2, 1, 3, 4) / scaling_factor  # [B, C', T, H', W']
-    frames = [vae.decode(latent[:, :, t : t + 1]).sample for t in range(latent.shape[2])]
+    dec = lambda z: vae.decode(z).sample
+    frames = [checkpoint(dec, latent[:, :, t:t+1], use_reentrant=False)
+              for t in range(latent.shape[2])]
     return torch.cat(frames, dim=2)
 
 
@@ -304,6 +309,7 @@ class PerceptualLoss:
         self.edge_model = build_edge_model(device) if edge_aware else None
         logger.info(f"Perceptual loss: mode={self.mode}, metric={metric_name}, weight={self.weight}")
 
+    
     def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Both [B, C, F, H, W] in [0, 1]."""
         if self.metric is None:
@@ -315,9 +321,13 @@ class PerceptualLoss:
             p = pred[:, :, f].to(dtype=torch.float32, device=self.device)
             g = target[:, :, f].to(dtype=torch.float32, device=self.device)
             # .mean() is a no-op for a scalar metric and reduces a per-sample one, so backward() always gets a scalar.
-            total = total + self.metric(p, g).mean()
-            if self.edge_model is not None:
-                total = total + self.metric(self.edge_model(p), self.edge_model(g)).mean()
+            def _frame_loss(p, g):
+                t = self.metric(p, g).mean()
+                if self.edge_model is not None:
+                    t = t + self.metric(self.edge_model(p), self.edge_model(g)).mean()
+                return t
+
+            total = total + checkpoint(_frame_loss, p, g, use_reentrant=False)
 
         divisor = num_frames * 2 if self.edge_model is not None else num_frames
         return (total / divisor) * self.weight
@@ -367,12 +377,22 @@ def resolve_prompt_embedding(
 ) -> torch.Tensor:
     """Embedding for `prompt`, broadcast across the batch."""
     if prompt == "" and empty_prompt_embedding is not None:
-        embedding = empty_prompt_embedding.to(device, dtype=dtype)
+        embedding = empty_prompt_embedding
+    elif getattr(pipe, "text_encoder", None) is not None:
+        embedding = encode_text_cached(pipe, prompt, device, prompt_cache)
+    else:
+        raise RuntimeError(
+            f"Non-empty prompt {prompt!r} but the text encoder isn't loaded (text_encoder=None) "
+            "and there's no cached embedding for it. Use empty prompts or cache embeddings."
+        )
 
+    embedding = embedding.to(device, dtype=dtype)
+    if embedding.ndim == 2:                      # [seq, dim] -> [1, seq, dim]
+        embedding = embedding.unsqueeze(0)
     if embedding.shape[0] != batch_size:
         if embedding.shape[0] != 1:
             raise ValueError(f"Cannot broadcast prompt embedding {tuple(embedding.shape)} to batch {batch_size}")
-        embedding = embedding.repeat(batch_size, 1, 1)
+        embedding = embedding.expand(batch_size, -1, -1)
     return embedding
 
 
@@ -484,7 +504,7 @@ def forward_stage2(
 # 6. Model setup
 # --------------------------------------------------------------------------- #
 def load_pipeline(args: argparse.Namespace, dtype: torch.dtype, device: str) -> CogVideoXPipeline:
-    pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
+    pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype, tokenizer=None, text_encoder=None)
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
     pipe.to(device)
 
@@ -511,19 +531,25 @@ def load_full_transformer_weights(pipe: CogVideoXPipeline, init_from: str) -> No
 
     logger.info(f"Loading stage-1 transformer weights from {ckpt_path}")
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    missing, unexpected = pipe.transformer.load_state_dict(state_dict, strict=False)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("module.", "") if k.startswith("module.") else k
+        new_state_dict[new_key] = v
+    
+    # Load into the transformer
+    missing, unexpected = pipe.transformer.load_state_dict(new_state_dict, strict=True)
+    print("✅ Full custom transformer weights loaded successfully.")
     if missing:
         logger.warning(f"{len(missing)} missing key(s) loading stage-1 ckpt (up to 5): {missing[:5]}")
     if unexpected:
         logger.warning(f"{len(unexpected)} unexpected key(s) loading stage-1 ckpt (up to 5): {unexpected[:5]}")
-
+    del state_dict, new_state_dict
+    gc.collect()
 
 def setup_trainable_modules(
     pipe: CogVideoXPipeline, args: argparse.Namespace, dtype: torch.dtype
 ) -> List[torch.nn.Parameter]:
     """Freeze text encoder + VAE; set up full-FT or LoRA on the transformer; return trainable params."""
-    pipe.text_encoder.requires_grad_(False)
-    pipe.text_encoder.eval()
     pipe.vae.requires_grad_(False)
     pipe.vae.eval()
 
@@ -532,18 +558,18 @@ def setup_trainable_modules(
             from peft import LoraConfig, PeftModel, get_peft_model
         except ImportError as e:
             raise ImportError("--use_lora requires `peft`: pip install peft") from e
-
-        if args.init_from:
-            logger.info(f"Loading stage-1 LoRA adapter from {args.init_from}")
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.target_modules,
+            lora_dropout=0.05,
+            bias="none",
+        )
+        if args.init_from and os.path.exists(os.path.join(args.init_from, "adapter_config.json")):
             pipe.transformer = PeftModel.from_pretrained(pipe.transformer, args.init_from, is_trainable=True)
         else:
-            logger.info(f"Wrapping transformer with a fresh LoRA adapter (rank={args.lora_rank}, alpha={args.lora_alpha})")
-            lora_config = LoraConfig(
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                target_modules=args.target_modules,
-                init_lora_weights=True,
-            )
+            if args.init_from:
+                load_full_transformer_weights(pipe, args.init_from)  # Stage-1 full weights as the base
             pipe.transformer = get_peft_model(pipe.transformer, lora_config)
     else:
         if args.init_from:
@@ -688,6 +714,7 @@ def build_batch_iterator(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
             jpeg_prob=args.jpeg_prob,
             video_compress_prob=args.video_compress_prob,
         ),
+        logger=logger
     )
     logger.info(f"Video clips: {len(dataset)}")
     loader = DataLoader(
@@ -920,8 +947,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_fps", type=int, default=8)
 
     args = p.parse_args()
-    if (args.num_frames - 1) % 8 != 0:
-        p.error(f"--num_frames must satisfy (F - 1) % 8 == 0, got {args.num_frames}")
     return args
 
 

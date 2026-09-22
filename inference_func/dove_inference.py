@@ -497,108 +497,110 @@ def process_video(
     noise_step: int = 0,
     sr_noise_step: int = 399,
     empty_prompt_embedding: torch.Tensor = None,
+    compute_dtype = torch.float16
 ):
     # SR the video frames based on the prompt.
     # `num_frames` is the Number of frames to generate.
 
     # Decode video
-    video = video.to(pipe.vae.device, dtype=pipe.vae.dtype)
-    latent_dist = pipe.vae.encode(video).latent_dist
-    latent = latent_dist.sample() * pipe.vae.config.scaling_factor
+    with torch.autocast(device_type="cuda", dtype=compute_dtype):
+        video = video.to(pipe.vae.device, dtype=pipe.vae.dtype)
+        latent_dist = pipe.vae.encode(video).latent_dist
+        latent = latent_dist.sample() * pipe.vae.config.scaling_factor
 
-    patch_size_t = pipe.transformer.config.patch_size_t
-    if patch_size_t is not None:
-        ncopy = latent.shape[2] % patch_size_t
-        # Copy the first frame ncopy times to match patch_size_t
-        first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
-        latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
+        patch_size_t = pipe.transformer.config.patch_size_t
+        if patch_size_t is not None:
+            ncopy = latent.shape[2] % patch_size_t
+            # Copy the first frame ncopy times to match patch_size_t
+            first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
+            latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
 
-        assert latent.shape[2] % patch_size_t == 0
+            assert latent.shape[2] % patch_size_t == 0
 
-    batch_size, num_channels, num_frames, height, width = latent.shape
+        batch_size, num_channels, num_frames, height, width = latent.shape
+        
+        # Get prompt embeddings
+        if prompt == "" and empty_prompt_embedding is not None:
+            # Use pre-loaded empty prompt embedding
+            prompt_embedding = empty_prompt_embedding.to(latent.device, dtype=latent.dtype)
+            # Expand to match batch size if needed
+            if prompt_embedding.shape[0] != batch_size:
+                prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
+        else:
+            # Encode the prompt
+            prompt_token_ids = pipe.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=pipe.transformer.config.max_text_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
+            prompt_token_ids = prompt_token_ids.input_ids
+            prompt_embedding = pipe.text_encoder(
+                prompt_token_ids.to(latent.device)
+            )[0]
+            _, seq_len, _ = prompt_embedding.shape
+            prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
 
-    # Get prompt embeddings
-    if prompt == "" and empty_prompt_embedding is not None:
-        # Use pre-loaded empty prompt embedding
-        prompt_embedding = empty_prompt_embedding.to(latent.device, dtype=latent.dtype)
-        # Expand to match batch size if needed
-        if prompt_embedding.shape[0] != batch_size:
-            prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
-    else:
-        # Encode the prompt
-        prompt_token_ids = pipe.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=pipe.transformer.config.max_text_seq_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        prompt_token_ids = prompt_token_ids.input_ids
-        prompt_embedding = pipe.text_encoder(
-            prompt_token_ids.to(latent.device)
-        )[0]
-        _, seq_len, _ = prompt_embedding.shape
-        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
+        latent = latent.permute(0, 2, 1, 3, 4)
 
-    latent = latent.permute(0, 2, 1, 3, 4)
-
-    # Add noise to latent (Select)
-    if noise_step != 0:
-        noise = torch.randn_like(latent)
-        add_timesteps = torch.full(
+        # Add noise to latent (Select)
+        if noise_step != 0:
+            noise = torch.randn_like(latent)
+            add_timesteps = torch.full(
+                (batch_size,),
+                fill_value=noise_step,
+                dtype=torch.long,
+                device=latent.device,
+            )
+            latent = pipe.scheduler.add_noise(latent, noise, add_timesteps)
+        
+        timesteps = torch.full(
             (batch_size,),
-            fill_value=noise_step,
+            fill_value=sr_noise_step,
             dtype=torch.long,
             device=latent.device,
         )
-        latent = pipe.scheduler.add_noise(latent, noise, add_timesteps)
-    
-    timesteps = torch.full(
-        (batch_size,),
-        fill_value=sr_noise_step,
-        dtype=torch.long,
-        device=latent.device,
-    )
 
-    # Prepare rotary embeds
-    vae_scale_factor_spatial = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
-    transformer_config = pipe.transformer.config
-    rotary_emb = (
-        prepare_rotary_positional_embeddings(
-            height=height * vae_scale_factor_spatial,
-            width=width * vae_scale_factor_spatial,
-            num_frames=num_frames,
-            transformer_config=transformer_config,
-            vae_scale_factor_spatial=vae_scale_factor_spatial,
-            device=latent.device,
+        # Prepare rotary embeds
+        vae_scale_factor_spatial = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
+        transformer_config = pipe.transformer.config
+        rotary_emb = (
+            prepare_rotary_positional_embeddings(
+                height=height * vae_scale_factor_spatial,
+                width=width * vae_scale_factor_spatial,
+                num_frames=num_frames,
+                transformer_config=transformer_config,
+                vae_scale_factor_spatial=vae_scale_factor_spatial,
+                device=latent.device,
+            )
+            if pipe.transformer.config.use_rotary_positional_embeddings
+            else None
         )
-        if pipe.transformer.config.use_rotary_positional_embeddings
-        else None
-    )
 
-    # Predict noise
-    predicted_noise = pipe.transformer(
-        hidden_states=latent,
-        encoder_hidden_states=prompt_embedding,
-        timestep=timesteps,
-        image_rotary_emb=rotary_emb,
-        return_dict=False,
-    )[0]
-    
-    latent_generate = pipe.scheduler.get_velocity(
-        predicted_noise, latent, timesteps
-    )
+        # Predict noise
+        predicted_noise = pipe.transformer(
+            hidden_states=latent,
+            encoder_hidden_states=prompt_embedding,
+            timestep=timesteps,
+            image_rotary_emb=rotary_emb,
+            return_dict=False,
+        )[0]
+        
+        latent_generate = pipe.scheduler.get_velocity(
+            predicted_noise, latent, timesteps
+        )
 
-    # generate video
-    if patch_size_t is not None and ncopy > 0:
-        latent_generate = latent_generate[:, ncopy:, :, :, :]
+        # generate video
+        if patch_size_t is not None and ncopy > 0:
+            latent_generate = latent_generate[:, ncopy:, :, :, :]
 
-    # [B, C, F, H, W]
-    video_generate = pipe.decode_latents(latent_generate)
-    video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
-    
-    return video_generate
+        # [B, C, F, H, W]
+        video_generate = pipe.decode_latents(latent_generate)
+        video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
+        
+        return video_generate
 
 
 if __name__ == "__main__":
@@ -640,8 +642,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--save_format", type=str, default="yuv444p", help="Save output as PNG sequence")
 
-    p.add_argument("--drop_ratio", type=float, default=0.35)
-    p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
+    parser.add_argument("--drop_ratio", type=float, default=0.35)
+    parser.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
 
     # Crop and Tiling Parameters
     parser.add_argument("--tile_size_hw", type=int, nargs=2, default=(0, 0), help="Tile size for spatial tiling (height, width)")
@@ -728,13 +730,6 @@ if __name__ == "__main__":
     pipe = CogVideoXPipeline.from_pretrained(args.model_path, dtype=dtype, tokenizer=None, text_encoder=None)
 
     # If you're using with lora, add this code
-    if args.lora_path:
-        print(f"Loading LoRA weights from {args.lora_path}")
-        pipe.load_lora_weights(
-            args.lora_path, weight_name="pytorch_lora_weights.safetensors", adapter_name="test_1"
-        )
-        pipe.fuse_lora(components=["transformer"], lora_scale=1.0) # lora_scale = lora_alpha / rank
-    
     if args.init_from:
         print(f"🚀 Loading FULL custom transformer weights from: {args.init_from}")
         # Load state dict to CPU first to avoid GPU OOM during loading
@@ -753,6 +748,15 @@ if __name__ == "__main__":
         del state_dict, new_state_dict
         gc.collect()
 
+    if args.lora_path:
+        from peft import LoraConfig, PeftModel, get_peft_model
+        print(f"Loading LoRA weights from {args.lora_path}")
+        pipe.transformer = PeftModel.from_pretrained(
+            pipe.transformer,
+            args.lora_path,
+            adapter_name="lora",
+        )    
+        pipe.transformer.set_adapter("lora")
     # 2. Set Scheduler.
     # Can be changed to `CogVideoXDPMScheduler` or `CogVideoXDDIMScheduler`.
     # We recommend using `CogVideoXDDIMScheduler` for CogVideoX-2B.

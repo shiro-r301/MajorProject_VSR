@@ -60,7 +60,7 @@ decord.bridge.set_bridge("torch")
 
 import pyiqa
 
-from metric_utils import evaluate_video_metrics, fr_metrics
+from MajorProject_VSR.evaluation.metric_utils import evaluate_video_metrics, fr_metrics
 
 try:
     from torchvision.io import write_video
