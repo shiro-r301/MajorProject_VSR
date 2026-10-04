@@ -60,10 +60,9 @@ from transformers import set_seed
 from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
 from MajorProject_VSR.inference_func.inference import DOVEInferenceFn
 from MajorProject_VSR.inference_func.dove_inference import log_memory
-from MajorProject_VSR.train.train import log_tensor_stats, prepare_rotary_positional_embeddings, spatial_upsample_video
+from MajorProject_VSR.train.train import log_tensor_stats, prepare_rotary_positional_embeddings, spatial_upsample_video, configure_tcg_module
 from contextlib import nullcontext
 
-torch.autograd.set_detect_anomaly(True)
 
 try:
     from diffusers.training_utils import cast_training_params
@@ -934,7 +933,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--log_level", type=str, default="DEBUG", choices=["DEBUG", "INFO", "WARNING"],
+    p.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING"],
                    help="DEBUG enables per-tensor stats (GPU syncs); use INFO for speed.")
     p.add_argument("--param_report", type=str, default="summary", choices=["none", "summary", "detailed"],
                    help="'detailed' writes a per-layer table to the log file.")
@@ -974,6 +973,8 @@ def main() -> None:
 
     logger.info(f"Loading CogVideoX pipeline from {args.model_path} ...")
     pipe = load_pipeline(args, dtype, device)
+
+    configure_tcg_module(pipe=pipe, drop_ratio=args.drop_ratio, block_intervals=args.block_intervals)
     
     trainable_params = setup_trainable_modules(pipe, args, dtype)
     if args.param_report != "none":

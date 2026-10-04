@@ -36,6 +36,11 @@ OUTPUT_ARGS=(
     --output_dir "/home/jl_fs/MajorProject_VSR/checkpoints/part2/stage_2"
 )
 
+TCG_ARGS=(
+    --drop_ratio 0.42
+    --block_intervals 14 21 32 39
+)
+
 # Data Configuration
 DATA_ARGS=(
     --video_dir "/home/jl_fs/train_test_dataset/HQ-VSR"

@@ -22,6 +22,7 @@ import argparse
 import logging
 import os
 import time
+import gc
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +30,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import CogVideoXDPMScheduler, CogVideoXPipeline
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
+from diffusers.training_utils import cast_training_params
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -36,6 +38,8 @@ from transformers import set_seed
 
 import decord  # isort:skip
 from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
+from MajorProject_VSR.evaluation.validation import validation_pred
+from MajorProject_VSR.inference_func.inference import DOVEInferenceFn
 
 decord.bridge.set_bridge("torch")  # dataset loader expects torch tensors from decord
 
@@ -364,6 +368,36 @@ def forward_stage1(
         dump_tensors(locals(), "CRASH_STATE")
         raise
 
+def run_periodic_validation(pipe, args, global_step, empty_prompt_embedding):
+    if not (args.val_lr_dir and args.val_gt_dir):
+        return
+    fn = DOVEInferenceFn(
+        pipe=pipe, upscale=args.upscale, upscale_mode="bilinear",
+        noise_step=args.noise_step, sr_noise_step=args.sr_noise_step,
+        empty_prompt_embedding=empty_prompt_embedding,
+        # tile_size_hw=(320, 640), overlap_hw=(32, 32),  # optional, lower memory
+    )
+    tcg_log = logging.getLogger("tcg_logger")  # use the real name from the transformer file
+    prev_level = tcg_log.level
+    tcg_log.setLevel(logging.WARNING)
+    pipe.transformer.eval()
+    torch.cuda.empty_cache()
+    pred_dir = os.path.join(args.output_dir, "val_preds", f"step_{global_step}")
+    try:
+        report = validation_pred(
+            pred_path=pred_dir, gt_path=args.val_gt_dir,
+            eval_metrics=[m.strip().lower() for m in args.val_metrics.split(",") if m.strip()],
+            model=pipe.transformer, lr_path=args.val_lr_dir, inference_fn=fn,
+            output_json=os.path.join(pred_dir, "validation_metrics.json"),
+            fps=args.val_fps, overwrite_preds=True,
+        )
+        logger.info(f"[VALIDATION] step {global_step}: {report['average']}")
+    except Exception as e:
+        logger.error(f"[VALIDATION] step {global_step} failed: {e}")
+    finally:
+        pipe.transformer.train()
+        tcg_log.setLevel(prev_level)
+        torch.cuda.empty_cache()
 
 # --------------------------------------------------------------------------- #
 # 4. Model setup
@@ -381,10 +415,12 @@ def configure_tcg_module(pipe: CogVideoXPipeline, drop_ratio: float, block_inter
     on the base module whose forward reads them.
     """
     intervals = sorted(block_intervals)
-    pipe.transformer.drop_ratio = drop_ratio
+    pipe.transformer.tcg.drop_ratio = drop_ratio
     pipe.transformer.merger_layers = intervals[::2]
     pipe.transformer.unmerger_layers = intervals[1::2]
-
+    logger.info(f"TCG MODULE CONFIGURATIONS:- Drop Ratio: {pipe.transformer.tcg.drop_ratio}, \
+                Merge Intervals: {pipe.transformer.merger_layers}, Unmerger Intervals: {pipe.transformer.unmerger_layers} \
+                Mode: {"TEMPORAL" if pipe.transformer.tcg.use_temporal_grouping else "SPATIAL"}")
 
 def load_init_weights(pipe: CogVideoXPipeline, init_from: str) -> None:
     """Initialise the transformer from a previous stage's `transformer.pt`.
@@ -405,41 +441,73 @@ def load_init_weights(pipe: CogVideoXPipeline, init_from: str) -> None:
     if unexpected:
         logger.warning(f"{len(unexpected)} unexpected key(s) loading stage-1 ckpt (up to 5): {unexpected[:5]}")
 
+def load_full_transformer_weights(pipe: CogVideoXPipeline, init_from: str) -> None:
+    ckpt_path = os.path.join(init_from, "transformer.pt")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"--init_from given but no transformer.pt found at {ckpt_path}")
 
-def setup_trainable_modules(pipe: CogVideoXPipeline, args: argparse.Namespace) -> List[torch.nn.Parameter]:
-    """Freeze/unfreeze components, optionally wrap in LoRA, return trainable params."""
-    pipe.text_encoder.requires_grad_(False)
-    pipe.text_encoder.eval()
+    logger.info(f"Loading stage-1 transformer weights from {ckpt_path}")
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("module.", "") if k.startswith("module.") else k
+        new_state_dict[new_key] = v
+    
+    # Load into the transformer
+    missing, unexpected = pipe.transformer.load_state_dict(new_state_dict, strict=True)
+    print("✅ Full custom transformer weights loaded successfully.")
+    if missing:
+        logger.warning(f"{len(missing)} missing key(s) loading stage-1 ckpt (up to 5): {missing[:5]}")
+    if unexpected:
+        logger.warning(f"{len(unexpected)} unexpected key(s) loading stage-1 ckpt (up to 5): {unexpected[:5]}")
+    del state_dict, new_state_dict
+    gc.collect()
 
-    if args.train_vae:
-        pipe.vae.requires_grad_(True)
-        pipe.vae.train()
-    else:
-        pipe.vae.requires_grad_(False)
-        pipe.vae.eval()
+
+def setup_trainable_modules(
+    pipe: CogVideoXPipeline, args: argparse.Namespace, dtype: torch.dtype
+) -> List[torch.nn.Parameter]:
+    """Freeze text encoder + VAE; set up full-FT or LoRA on the transformer; return trainable params."""
+    pipe.vae.requires_grad_(False)
+    pipe.vae.eval()
 
     if args.use_lora:
-        from peft import LoraConfig, get_peft_model
-
+        try:
+            from peft import LoraConfig, PeftModel, get_peft_model
+        except ImportError as e:
+            raise ImportError("--use_lora requires `peft`: pip install peft") from e
         lora_config = LoraConfig(
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
-            target_modules=LORA_TARGET_MODULES,
-            init_lora_weights="gaussian",
+            target_modules=args.target_modules,
+            lora_dropout=0.05,
+            bias="none",
         )
-        pipe.transformer = get_peft_model(pipe.transformer, lora_config)
-        params = [p for p in pipe.transformer.parameters() if p.requires_grad]
+        if args.init_from and os.path.exists(os.path.join(args.init_from, "adapter_config.json")):
+            pipe.transformer = PeftModel.from_pretrained(pipe.transformer, args.init_from, is_trainable=True)
+        else:
+            if args.init_from:
+                load_full_transformer_weights(pipe, args.init_from)  # Stage-1 full weights as the base
+            pipe.transformer = get_peft_model(pipe.transformer, lora_config)
     else:
+        if args.init_from:
+            load_full_transformer_weights(pipe, args.init_from)
         pipe.transformer.requires_grad_(True)
-        params = list(pipe.transformer.parameters())
 
-    if args.train_vae:
-        params += list(pipe.vae.parameters())
+    if args.fp32_master_weights and dtype != torch.float32:
+        cast_training_params([pipe.transformer], dtype=torch.float32)
+        if not args.use_lora:
+            logger.warning("Full fine-tune with fp32 master weights roughly doubles weight memory; "
+                           "use --use_lora or --no_fp32_master_weights if you OOM.")
+        logger.info(f"Trainable params cast to fp32; compute runs under autocast({dtype}).")
 
     pipe.transformer.train()
     if args.gradient_checkpointing:
         pipe.transformer.enable_gradient_checkpointing()
-    return params
+        logger.info("Gradient checkpointing enabled (transformer only; VAE decoder is not checkpointed).")
+
+    return [p for p in pipe.transformer.parameters() if p.requires_grad]
+
 
 
 def load_empty_prompt_embedding(path: str) -> Optional[torch.Tensor]:
@@ -548,6 +616,8 @@ def train(
         optimizer.zero_grad()
         t_iter_end = time.time()
         stop_training = False
+        print(f"{"="*20} EPOCH START VALIDATION {"="*20}")
+        run_periodic_validation(pipe, args, global_step, empty_prompt_embedding)
 
         for micro_step, batch in enumerate(progress):
             logger.debug(f"[DATA] micro_step {micro_step}: waited {time.time() - t_iter_end:.3f}s for batch")
@@ -589,6 +659,7 @@ def train(
                         pipe, os.path.join(args.output_dir, f"checkpoint-{global_step}"),
                         args.use_lora, args.train_vae,
                     )
+                    run_periodic_validation(pipe, args, global_step, empty_prompt_embedding)
 
                 if args.max_train_steps and global_step >= args.max_train_steps:
                     stop_training = True
@@ -653,6 +724,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--drop_ratio", type=float, default=0.35)
     p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
 
+    # Validation args
+    p.add_argument("--val_lr_dir", type=str, default=None)
+    p.add_argument("--val_gt_dir", type=str, default=None)
+    p.add_argument("--val_metrics", type=str, default="psnr,ssim,lpips,dists")
+    p.add_argument("--val_steps", type=int, default=0, help="0 disables")
+    p.add_argument("--val_fps", type=int, default=8)
+    p.add_argument("--enable_slicing", action="store_true")
+    p.add_argument("--enable_tiling", action="store_true")
+    
     # Logging / checkpointing
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--log_steps", type=int, default=10)
@@ -694,8 +774,6 @@ def main() -> None:
     pipe = load_pipeline(args.model_path, dtype, device)
 
     configure_tcg_module(pipe, args.drop_ratio, args.block_intervals)  # before PEFT wrapping
-    if args.init_from:
-        load_init_weights(pipe, args.init_from)  # before PEFT wrapping
 
     trainable_params = setup_trainable_modules(pipe, args)
     if args.param_report != "none":

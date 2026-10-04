@@ -45,12 +45,20 @@ DEGRADATION_ARGS=(
 
 # Training Configuration
 TRAIN_ARGS=(
-    --num_epochs 1000  # upper bound; training stops at max_train_steps
-    --max_train_steps 10000
-    --seed 42
-    --batch_size 2
-    --gradient_accumulation_steps 1
+    --num_epochs 10  # upper bound; training stops at max_train_steps
+    --max_train_steps 1000
+    --seed 3114121
+    --batch_size 1
+    --gradient_accumulation_steps 8
     --learning_rate 2e-5
+)
+
+VALIDATION_ARGS=(
+    --val_lr_dir "/home/jl_fs/train_test_dataset/UDM10/LQ-Video"
+    --val_gt_dir "/home/jl_fs/train_test_dataset/UDM10/GT-Video"
+    --val_metrics "psnr,ssim,lpips,dists"
+    --val_steps 100
+    --val_fps 8
 )
 
 # SR parameters
@@ -62,13 +70,13 @@ SR_ARGS=(
 
 # TCG module
 TCG_ARGS=(
-    --drop_ratio 0.35
-    --block_intervals 20 25 32 37
+    --drop_ratio 0.42
+    --block_intervals 14 21 32 39
 )
 
 # Checkpointing / Logging Configuration
 CHECKPOINT_ARGS=(
-    --save_steps 400  # save checkpoint every x steps
+    --save_steps 100  # save checkpoint every x steps
     --log_steps 10
     --log_level "INFO"  # ["DEBUG", "INFO", "WARNING"]; DEBUG adds per-tensor stats (slower)
     --param_report "summary"  # ["none", "summary", "detailed"]
@@ -79,6 +87,7 @@ python train_stage1.py \
     "${MODEL_ARGS[@]}" \
     "${LORA_ARGS[@]}" \
     "${OUTPUT_ARGS[@]}" \
+    "${VALIDATION_ARGS[@]}" \
     "${DATA_ARGS[@]}" \
     "${DEGRADATION_ARGS[@]}" \
     "${TRAIN_ARGS[@]}" \
