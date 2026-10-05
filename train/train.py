@@ -25,6 +25,7 @@ import time
 import gc
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -68,7 +69,7 @@ def setup_logging(output_dir: str, level: str) -> None:
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
 
-    file_handler = logging.FileHandler(os.path.join(output_dir, "train_debug.log"))
+    file_handler = logging.FileHandler(os.path.join(output_dir, "train_debug.log"), mode='w', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(fmt)
 
@@ -128,37 +129,41 @@ def dump_tensors(state: Dict[str, Any], prefix: str) -> None:
             log_tensor_stats(value, f"{prefix} -> {key}", level=logging.ERROR)
 
 
-def log_parameter_summary(pipe: CogVideoXPipeline, use_lora: bool, train_vae: bool, detailed: bool) -> None:
-    """Count trainable/frozen params. Per-layer lines go to DEBUG (i.e. the log file)."""
-    modules = [("", pipe.transformer)]
-    if train_vae:
-        modules.append(("VAE.", pipe.vae))
+def log_parameter_summary(pipe: CogVideoXPipeline, use_lora: bool, expect_fp32: bool, detailed: bool) -> None:
+    """Trainable/frozen counts plus sanity checks. Per-layer lines go to DEBUG (log file only)."""
+    total = trainable = lora_trainable = orig_trainable = 0
+    non_fp32: List[str] = []
 
-    total = trainable = lora_trainable = orig_transformer_trainable = 0
-    for prefix, module in modules:
-        for name, param in module.named_parameters():
-            n = param.numel()
-            total += n
-            if param.requires_grad:
-                trainable += n
-                is_lora = "lora" in name.lower()
-                if is_lora:
-                    lora_trainable += n
-                elif prefix == "":
-                    orig_transformer_trainable += n
-                tag = "LoRA" if is_lora else "TRAINABLE"
+    for name, param in pipe.transformer.named_parameters():
+        n = param.numel()
+        total += n
+        if param.requires_grad:
+            trainable += n
+            is_lora = "lora" in name.lower()
+            if is_lora:
+                lora_trainable += n
             else:
-                tag = "FROZEN"
-            if detailed:
-                logger.debug(f"  [{tag:<9}] {prefix}{name:<65} | shape={tuple(param.shape)} | {n:,}")
+                orig_trainable += n
+            if param.dtype != torch.float32:
+                non_fp32.append(name)
+            tag = "LoRA" if is_lora else "TRAINABLE"
+        else:
+            tag = "FROZEN"
+        if detailed:
+            logger.debug(f"  [{tag:<9}] {name:<65} | shape={tuple(param.shape)} | dtype={param.dtype} | {n:,}")
 
-    logger.info(f"Params (transformer{' + VAE' if train_vae else ''}): total={total:,}, "
-                f"trainable={trainable:,} ({100 * trainable / max(total, 1):.4f}%)")
+    vae_trainable = sum(p.numel() for p in pipe.vae.parameters() if p.requires_grad)
+
+    logger.info(f"Transformer params: total={total:,}, trainable={trainable:,} "
+                f"({100 * trainable / max(total, 1):.4f}%)")
     if use_lora:
         logger.info(f"  LoRA trainable: {lora_trainable:,}")
-        if orig_transformer_trainable > 0:
-            logger.warning(f"  {orig_transformer_trainable:,} non-LoRA transformer params are trainable "
-                           f"(expected 0 for pure LoRA)")
+        if orig_trainable > 0:
+            logger.warning(f"  {orig_trainable:,} non-LoRA transformer params are trainable (expected 0)")
+    if vae_trainable > 0:
+        logger.warning(f"  VAE has {vae_trainable:,} trainable params (Stage 2 must keep the VAE frozen)")
+    if expect_fp32 and non_fp32:
+        logger.warning(f"  {len(non_fp32)} trainable param(s) are not fp32 (up to 5): {non_fp32[:5]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -250,34 +255,35 @@ def pad_latent_frames(latent: torch.Tensor, patch_size_t: Optional[int]) -> Tupl
     return latent, n_pad
 
 
-def get_prompt_embedding(
+def resolve_prompt_embedding(
     pipe: CogVideoXPipeline,
     prompt: str,
     batch_size: int,
     empty_prompt_embedding: Optional[torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    prompt_cache: Optional[Dict[str, torch.Tensor]],
 ) -> torch.Tensor:
-    """Text embedding for `prompt`, broadcast across the batch."""
+    """Embedding for `prompt`, broadcast across the batch."""
     if prompt == "" and empty_prompt_embedding is not None:
-        embedding = empty_prompt_embedding.to(device, dtype=dtype)
+        embedding = empty_prompt_embedding
+    elif getattr(pipe, "text_encoder", None) is not None:
+        embedding = encode_text_cached(pipe, prompt, device, prompt_cache)
     else:
-        token_ids = pipe.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=pipe.transformer.config.max_text_seq_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        ).input_ids
-        with torch.no_grad():
-            embedding = pipe.text_encoder(token_ids.to(device))[0].to(dtype=dtype)
+        raise RuntimeError(
+            f"Non-empty prompt {prompt!r} but the text encoder isn't loaded (text_encoder=None) "
+            "and there's no cached embedding for it. Use empty prompts or cache embeddings."
+        )
 
+    embedding = embedding.to(device, dtype=dtype)
+    if embedding.ndim == 2:                      # [seq, dim] -> [1, seq, dim]
+        embedding = embedding.unsqueeze(0)
     if embedding.shape[0] != batch_size:
         if embedding.shape[0] != 1:
             raise ValueError(f"Cannot broadcast prompt embedding {tuple(embedding.shape)} to batch {batch_size}")
-        embedding = embedding.repeat(batch_size, 1, 1)
+        embedding = embedding.expand(batch_size, -1, -1)
     return embedding
+
 
 
 def forward_stage1(
@@ -289,6 +295,7 @@ def forward_stage1(
     sr_noise_step: int,
     empty_prompt_embedding: Optional[torch.Tensor],
     freeze_vae: bool,
+    autocast_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Returns (predicted_latent, target_latent), both [B, T', C', H', W']."""
     try:
@@ -315,7 +322,7 @@ def forward_stage1(
         batch_size, _, num_frames, latent_h, latent_w = lr_latent.shape
         log_tensor_stats(lr_latent, "LR Latent (padded)")
 
-        prompt_embedding = get_prompt_embedding(pipe, prompt, batch_size, empty_prompt_embedding, device, dtype)
+        prompt_embedding = resolve_prompt_embedding(pipe, prompt, batch_size, empty_prompt_embedding, device, dtype, prompt_cache={})
         log_tensor_stats(prompt_embedding, "Prompt Embedding")
 
         lr_latent = lr_latent.permute(0, 2, 1, 3, 4)  # -> [B, T', C', H', W']
@@ -342,13 +349,14 @@ def forward_stage1(
         log_tensor_stats(lr_latent, "LR Latent (DiT Input)")
         log_memory("Before DiT Forward")
 
-        model_output = pipe.transformer(
-            hidden_states=lr_latent,
-            encoder_hidden_states=prompt_embedding,
-            timestep=timesteps,
-            image_rotary_emb=rotary_emb,
-            return_dict=False,
-        )[0]
+        with autocast_ctx(device=pipe.device, dtype=autocast_dtype):
+            model_output = pipe.transformer(
+                hidden_states=lr_latent,
+                encoder_hidden_states=prompt_embedding,
+                timestep=timesteps,
+                image_rotary_emb=rotary_emb,
+                return_dict=False,
+            )[0]
         log_tensor_stats(model_output, "DiT Output")
 
         pred_latent = pipe.scheduler.get_velocity(model_output, lr_latent, timesteps)
@@ -369,6 +377,7 @@ def forward_stage1(
         raise
 
 def run_periodic_validation(pipe, args, global_step, empty_prompt_embedding):
+    
     if not (args.val_lr_dir and args.val_gt_dir):
         return
     fn = DOVEInferenceFn(
@@ -384,13 +393,14 @@ def run_periodic_validation(pipe, args, global_step, empty_prompt_embedding):
     torch.cuda.empty_cache()
     pred_dir = os.path.join(args.output_dir, "val_preds", f"step_{global_step}")
     try:
-        report = validation_pred(
-            pred_path=pred_dir, gt_path=args.val_gt_dir,
-            eval_metrics=[m.strip().lower() for m in args.val_metrics.split(",") if m.strip()],
-            model=pipe.transformer, lr_path=args.val_lr_dir, inference_fn=fn,
-            output_json=os.path.join(pred_dir, "validation_metrics.json"),
-            fps=args.val_fps, overwrite_preds=True,
-        )
+        with torch.no_grad():
+            report = validation_pred(
+                pred_path=pred_dir, gt_path=args.val_gt_dir,
+                eval_metrics=[m.strip().lower() for m in args.val_metrics.split(",") if m.strip()],
+                model=pipe.transformer, lr_path=args.val_lr_dir, inference_fn=fn,
+                output_json=os.path.join(pred_dir, "validation_metrics.json"),
+                fps=args.val_fps, overwrite_preds=True,
+            )
         logger.info(f"[VALIDATION] step {global_step}: {report['average']}")
     except Exception as e:
         logger.error(f"[VALIDATION] step {global_step} failed: {e}")
@@ -402,9 +412,17 @@ def run_periodic_validation(pipe, args, global_step, empty_prompt_embedding):
 # --------------------------------------------------------------------------- #
 # 4. Model setup
 # --------------------------------------------------------------------------- #
-def load_pipeline(model_path: str, dtype: torch.dtype, device: str) -> CogVideoXPipeline:
-    pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=dtype)
+def load_pipeline(model_path: str, dtype: torch.dtype, device: str, args) -> CogVideoXPipeline:
+    pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype, tokenizer=None, text_encoder=None)
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+    
+    if args.enable_slicing:
+        pipe.vae.enable_slicing()
+        logger.info("VAE slicing enabled.")
+    if args.enable_tiling:
+        pipe.vae.enable_tiling()
+        logger.info("VAE tiling enabled.")
+
     return pipe.to(device)
 
 
@@ -420,26 +438,7 @@ def configure_tcg_module(pipe: CogVideoXPipeline, drop_ratio: float, block_inter
     pipe.transformer.unmerger_layers = intervals[1::2]
     logger.info(f"TCG MODULE CONFIGURATIONS:- Drop Ratio: {pipe.transformer.tcg.drop_ratio}, \
                 Merge Intervals: {pipe.transformer.merger_layers}, Unmerger Intervals: {pipe.transformer.unmerger_layers} \
-                Mode: {"TEMPORAL" if pipe.transformer.tcg.use_temporal_grouping else "SPATIAL"}")
-
-def load_init_weights(pipe: CogVideoXPipeline, init_from: str) -> None:
-    """Initialise the transformer from a previous stage's `transformer.pt`.
-
-    Must run BEFORE PEFT wrapping: wrapping renames parameter keys
-    (adds `base_model.model.` and splits LoRA layers), so a plain
-    transformer state dict would no longer match.
-    """
-    ckpt_path = os.path.join(init_from, "transformer.pt")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"--init_from given but no transformer.pt found at {ckpt_path}")
-
-    logger.info(f"Loading stage-1 transformer weights from {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location="cpu")
-    missing, unexpected = pipe.transformer.load_state_dict(state_dict, strict=False)
-    if missing:
-        logger.warning(f"{len(missing)} missing key(s) loading stage-1 ckpt (up to 5): {missing[:5]}")
-    if unexpected:
-        logger.warning(f"{len(unexpected)} unexpected key(s) loading stage-1 ckpt (up to 5): {unexpected[:5]}")
+                Mode: {'TEMPORAL' if pipe.transformer.tcg.use_temporal_grouping else 'SPATIAL'}")
 
 def load_full_transformer_weights(pipe: CogVideoXPipeline, init_from: str) -> None:
     ckpt_path = os.path.join(init_from, "transformer.pt")
@@ -463,6 +462,11 @@ def load_full_transformer_weights(pipe: CogVideoXPipeline, init_from: str) -> No
     del state_dict, new_state_dict
     gc.collect()
 
+def autocast_ctx(device, dtype: Optional[torch.dtype]):
+    """bf16/fp16 autocast context; a no-op when dtype is None (fp32 / pure-bf16 run)."""
+    if dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=torch.device(device).type, dtype=dtype)
 
 def setup_trainable_modules(
     pipe: CogVideoXPipeline, args: argparse.Namespace, dtype: torch.dtype
@@ -484,6 +488,7 @@ def setup_trainable_modules(
             bias="none",
         )
         if args.init_from and os.path.exists(os.path.join(args.init_from, "adapter_config.json")):
+            logger.info("LOADING PRETRAINED LORA WEIGHTS")
             pipe.transformer = PeftModel.from_pretrained(pipe.transformer, args.init_from, is_trainable=True)
         else:
             if args.init_from:
@@ -513,10 +518,10 @@ def setup_trainable_modules(
 def load_empty_prompt_embedding(path: str) -> Optional[torch.Tensor]:
     p = Path(path)
     if not p.exists():
-        logger.warning(f"Empty-prompt embedding not found at {p}; empty prompts will go through the text encoder.")
+        logger.warning(f"Empty prompt embedding not found at {p}; prompts encoded on the fly.")
         return None
+    logger.info(f"Loaded empty prompt embedding from {p}")
     return load_file(str(p))["prompt_embedding"]
-
 
 # --------------------------------------------------------------------------- #
 # 5. Data setup
@@ -535,6 +540,7 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
             jpeg_prob=args.jpeg_prob,
             video_compress_prob=args.video_compress_prob,
         ),
+        logger=logger
     )
     return DataLoader(
         dataset,
@@ -549,14 +555,14 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
 # --------------------------------------------------------------------------- #
 # 6. Checkpointing
 # --------------------------------------------------------------------------- #
-def save_checkpoint(pipe: CogVideoXPipeline, path: str, use_lora: bool, train_vae: bool) -> None:
+def save_checkpoint(pipe: CogVideoXPipeline, path: str, use_lora: bool) -> None:
     os.makedirs(path, exist_ok=True)
     if use_lora:
         pipe.transformer.save_pretrained(path)
     else:
         torch.save(pipe.transformer.state_dict(), os.path.join(path, "transformer.pt"))
-    if train_vae:
-        torch.save(pipe.vae.state_dict(), os.path.join(path, "vae.pt"))
+    # if train_vae:
+        # torch.save(pipe.vae.state_dict(), os.path.join(path, "vae.pt"))
     logger.info(f"Saved checkpoint -> {path}")
 
 
@@ -569,6 +575,7 @@ def compute_loss(
     args: argparse.Namespace,
     empty_prompt_embedding: Optional[torch.Tensor],
     freeze_vae: bool,
+    autocast_dtype: torch.dtype
 ) -> torch.Tensor:
     lr_video, hr_video, prompt = prepare_batch(batch)
     pred_latent, target_latent = forward_stage1(
@@ -580,6 +587,7 @@ def compute_loss(
         sr_noise_step=args.sr_noise_step,
         empty_prompt_embedding=empty_prompt_embedding,
         freeze_vae=freeze_vae,
+        autocast_dtype=autocast_dtype
     )
     loss = F.mse_loss(pred_latent.float(), target_latent.float())
     if not torch.isfinite(loss):
@@ -589,6 +597,24 @@ def compute_loss(
     log_tensor_stats(loss, "Loss")
     return loss
 
+def grad_report(module):
+    rows = {"lora_A": [], "lora_B": []}
+    for n, p in module.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            k = "lora_A" if "lora_A" in n else "lora_B" if "lora_B" in n else None
+            if k:
+                rows[k].append(p.grad)
+    for k, gs in rows.items():
+        if not gs:
+            print(k, "no grads"); continue
+        numel = sum(g.numel() for g in gs)
+        zeros = sum((g == 0).sum().item() for g in gs) / numel
+        norm = torch.sqrt(sum((g.float() ** 2).sum() for g in gs)).item()
+        print(f"{k}: dtype={ {g.dtype for g in gs} } norm={norm:.3e} "
+              f"rms/param={norm/numel**0.5:.2e} zero_frac={zeros:.4f} "
+              f"nonfinite={sum((~torch.isfinite(g)).sum().item() for g in gs)}")
+
+# after the final backward of the accumulation window, before optimizer.step():
 
 def train(
     pipe: CogVideoXPipeline,
@@ -597,6 +623,7 @@ def train(
     args: argparse.Namespace,
     empty_prompt_embedding: Optional[torch.Tensor],
     freeze_vae: bool,
+    autocast_dtype: torch.dtype
 ) -> None:
     accum = args.gradient_accumulation_steps
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
@@ -616,13 +643,13 @@ def train(
         optimizer.zero_grad()
         t_iter_end = time.time()
         stop_training = False
-        print(f"{"="*20} EPOCH START VALIDATION {"="*20}")
-        run_periodic_validation(pipe, args, global_step, empty_prompt_embedding)
+        print(f"{'='*20} EPOCH START VALIDATION {'='*20}")
+        # run_periodic_validation(pipe, args, global_step, empty_prompt_embedding)
 
         for micro_step, batch in enumerate(progress):
             logger.debug(f"[DATA] micro_step {micro_step}: waited {time.time() - t_iter_end:.3f}s for batch")
             try:
-                loss = compute_loss(pipe, batch, args, empty_prompt_embedding, freeze_vae)
+                loss = compute_loss(pipe, batch, args, empty_prompt_embedding, freeze_vae, autocast_dtype=autocast_dtype)
                 (loss / accum).backward()
                 log_memory("After Backward")
             except Exception as e:
@@ -637,7 +664,11 @@ def train(
 
             if (micro_step + 1) % accum == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                if not torch.isfinite(grad_norm):
+                    logger.warning(f"non-finite grad_norm at step {global_step}; skipping")
+                    optimizer.zero_grad(); continue
                 optimizer.step()
+                grad_report(pipe.transformer)
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -657,7 +688,7 @@ def train(
                 if global_step % args.save_steps == 0:
                     save_checkpoint(
                         pipe, os.path.join(args.output_dir, f"checkpoint-{global_step}"),
-                        args.use_lora, args.train_vae,
+                        args.use_lora
                     )
                     run_periodic_validation(pipe, args, global_step, empty_prompt_embedding)
 
@@ -672,7 +703,7 @@ def train(
         if stop_training:
             break
 
-    save_checkpoint(pipe, os.path.join(args.output_dir, "final"), args.use_lora, args.train_vae)
+    save_checkpoint(pipe, os.path.join(args.output_dir, "final"), args.use_lora)
     logger.info(f"Training complete in {(time.time() - start_time) / 60:.1f}min.")
 
 
@@ -715,11 +746,15 @@ def parse_args() -> argparse.Namespace:
     # Model
     p.add_argument("--dtype", type=str, default="bfloat16", choices=list(DTYPES))
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--train_vae", action="store_true")
     p.add_argument("--use_lora", action="store_true")
     p.add_argument("--lora_rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=64)
-
+    p.add_argument("--target_modules", type=str, nargs="+", default=["to_q", "to_k", "to_v", "to_out.0"])
+    p.add_argument("--fp32_master_weights", action="store_true", default=True)
+    p.add_argument("--no_fp32_master_weights", dest="fp32_master_weights", action="store_false")
+    p.add_argument("--enable_slicing", action="store_true")
+    p.add_argument("--enable_tiling", action="store_true")
+    
     # TCG module
     p.add_argument("--drop_ratio", type=float, default=0.35)
     p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
@@ -730,8 +765,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_metrics", type=str, default="psnr,ssim,lpips,dists")
     p.add_argument("--val_steps", type=int, default=0, help="0 disables")
     p.add_argument("--val_fps", type=int, default=8)
-    p.add_argument("--enable_slicing", action="store_true")
-    p.add_argument("--enable_tiling", action="store_true")
     
     # Logging / checkpointing
     p.add_argument("--save_steps", type=int, default=500)
@@ -757,7 +790,7 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     setup_logging(args.output_dir, args.log_level)
 
-    freeze_vae = not args.train_vae
+    freeze_vae = True
     dtype = DTYPES[args.dtype]
 
     logger.info("=" * 64)
@@ -771,18 +804,18 @@ def main() -> None:
         logger.warning("CUDA not available — training on CPU will be extremely slow.")
 
     logger.info(f"Loading CogVideoX pipeline from {args.model_path} ...")
-    pipe = load_pipeline(args.model_path, dtype, device)
+    pipe = load_pipeline(args.model_path, dtype, device, args)
 
     configure_tcg_module(pipe, args.drop_ratio, args.block_intervals)  # before PEFT wrapping
-
-    trainable_params = setup_trainable_modules(pipe, args)
+    autocast_dtype = dtype if (args.fp32_master_weights and dtype != torch.float32) else None    
+    trainable_params = setup_trainable_modules(pipe, args, dtype=autocast_dtype)
     if args.param_report != "none":
-        log_parameter_summary(pipe, args.use_lora, args.train_vae, detailed=args.param_report == "detailed")
+        log_parameter_summary(pipe, args.use_lora, args.fp32_master_weights and dtype != torch.float32, detailed=args.param_report == "detailed")
 
     empty_prompt_embedding = load_empty_prompt_embedding(args.empty_prompt_embedding)
     dataloader = build_dataloader(args)
 
-    train(pipe, dataloader, trainable_params, args, empty_prompt_embedding, freeze_vae)
+    train(pipe, dataloader, trainable_params, args, empty_prompt_embedding, freeze_vae, autocast_dtype=autocast_dtype)
 
 
 if __name__ == "__main__":

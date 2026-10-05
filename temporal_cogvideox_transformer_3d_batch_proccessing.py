@@ -29,31 +29,35 @@ activations = []
 import logging
 import sys
 
-
 def setup_tcg_logging(log_file="tcg_execution.log"):
     logger = logging.getLogger("TCG_Logger")
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(logging.INFO)
 
-    # Prevent adding handlers multiple times if re-run in Jupyter/interactive shells
-    if not logger.handlers:
-        formatter = logging.Formatter('[%(asctime)s] [TCG] %(message)s', datefmt='%H:%M:%S')
+    # Clear any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
 
-        # 1. Console Handler (Standard Output)
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.WARNING)
-        ch.setFormatter(formatter)
+    # Prevent messages from propagating to the root logger
+    logger.propagate = False
 
-        # 2. File Handler (Text File)
-        # Use mode='w' to overwrite on every new run, or 'a' to append
-        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(formatter)
+    formatter = logging.Formatter(
+        "[%(asctime)s] [TCG] %(message)s",
+        datefmt="%H:%M:%S"
+    )
 
-        logger.addHandler(ch)
-        logger.addHandler(fh)
+    # Overwrite log file on every run
+    fh = logging.FileHandler(
+        log_file,
+        mode="w",
+        encoding="utf-8"
+    )
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    logger.addHandler(fh)
 
     return logger
-
 
 # Initialize the global logger for this file
 tcg_logger = setup_tcg_logging()
