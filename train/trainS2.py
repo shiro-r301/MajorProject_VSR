@@ -56,6 +56,7 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import set_seed
+torch.backends.cudnn.benchmark = True
 
 from MajorProject_VSR.dataloading.VideoFileLoader import VideoFileSRDataset
 from MajorProject_VSR.inference_func.inference import DOVEInferenceFn
@@ -187,7 +188,7 @@ def log_parameter_summary(pipe: CogVideoXPipeline, use_lora: bool, expect_fp32: 
 # --------------------------------------------------------------------------- #
 # 3. Frame-by-frame VAE encode/decode (Sec. 3.2, Eq. 5)
 # --------------------------------------------------------------------------- #
-def encode_frames_independently(vae, video: torch.Tensor, scaling_factor: float, freeze_vae: bool, chunk: int) -> torch.Tensor:
+def encode_frames_independently(vae, video: torch.Tensor, scaling_factor: float, freeze_vae: bool, chunk: int = 3) -> torch.Tensor:
     """[B, C, T, H, W] in [-1, 1] -> latent [B, C', T, H', W'] (same layout as Stage-1's vae.encode)."""
     if video.ndim != 5:
         raise ValueError(f"Expected video tensor [B,C,T,H,W], got {tuple(video.shape)}")
@@ -207,23 +208,23 @@ def encode_frames_independently(vae, video: torch.Tensor, scaling_factor: float,
     # return torch.cat(latents, dim=2)
 
 
-def decode_frames_independently(vae, latent, scaling_factor, chunk=3):
-    B, T, Cl, h, w = latent.shape                       # DiT layout
-    z = (latent / scaling_factor).reshape(B * T, Cl, 1, h, w)
-    dec = lambda x: vae.decode(x).sample
-    out = torch.cat([checkpoint(dec, c, use_reentrant=False) for c in z.split(chunk)])
-    return out.reshape(B, T, *out.shape[1:2], *out.shape[3:]).permute(0, 2, 1, 3, 4)
+# def decode_frames_independently(vae, latent, scaling_factor, chunk=2):
+#     B, T, Cl, h, w = latent.shape                       # DiT layout
+#     z = (latent / scaling_factor).reshape(B * T, Cl, 1, h, w)
+#     dec = lambda x: vae.decode(x).sample
+#     out = torch.cat([checkpoint(dec, c, use_reentrant=False) for c in z.split(chunk)])
+#     return out.reshape(B, T, *out.shape[1:2], *out.shape[3:]).permute(0, 2, 1, 3, 4)
 
-# def decode_frames_independently(vae, latent: torch.Tensor, scaling_factor: float) -> torch.Tensor:
-#     """[B, T, C', H', W'] (DiT layout) -> pixels [B, C, T, H, W] in roughly [-1, 1].
+def decode_frames_independently(vae, latent: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+    """[B, T, C', H', W'] (DiT layout) -> pixels [B, C, T, H, W] in roughly [-1, 1].
 
-#     Grad ALWAYS flows here: the decoder is on the loss path even though frozen.
-#     """
-#     latent = latent.permute(0, 2, 1, 3, 4) / scaling_factor  # [B, C', T, H', W']
-#     dec = lambda z: vae.decode(z).sample
-#     frames = [checkpoint(dec, latent[:, :, t:t+1], use_reentrant=False)
-#               for t in range(latent.shape[2])]
-#     return torch.cat(frames, dim=2)
+    Grad ALWAYS flows here: the decoder is on the loss path even though frozen.
+    """
+    latent = latent.permute(0, 2, 1, 3, 4) / scaling_factor  # [B, C', T, H', W']
+    dec = lambda z: vae.decode(z).sample
+    frames = [checkpoint(dec, latent[:, :, t:t+1], use_reentrant=False)
+              for t in range(latent.shape[2])]
+    return torch.cat(frames, dim=2)
 
 
 def pad_latent_frames(latent: torch.Tensor, patch_size_t: Optional[int]) -> Tuple[torch.Tensor, int]:
@@ -381,7 +382,7 @@ def compute_stage2_losses(
     """x_sr / x_hr in [-1, 1]. Returns total/mse/perceptual/frame_diff."""
     pred = to_unit_range(x_sr)
     target = to_unit_range(x_hr)
-    log_tensor_stats(pred, "video_generate ([0,1])")
+    # log_tensor_stats(pred, "video_generate ([0,1])")
 
     mse = F.mse_loss(pred.float(), target.float(), reduction="mean")
     perceptual = perceptual_fn(pred, target)
@@ -442,8 +443,8 @@ def forward_stage2(
     """
     try:
         logger.debug("--- [FORWARD STAGE 2 START] ---")
-        log_tensor_stats(lr_video, "Input LR Video")
-        log_tensor_stats(hr_video, "Input HR Video")
+        # log_tensor_stats(lr_video, "Input LR Video")
+        # log_tensor_stats(hr_video, "Input HR Video")
         log_memory("Before VAE Encode")
 
         device, dtype = pipe.vae.device, pipe.vae.dtype
@@ -454,16 +455,16 @@ def forward_stage2(
             hr_video = hr_video.to(device, dtype=dtype)
         num_input_frames = lr_video.shape[2]
 
-        lr_latent = encode_frames_independently(pipe.vae, lr_video, scaling_factor, freeze_vae)
+        lr_latent = encode_frames_independently(pipe.vae, lr_video, scaling_factor, freeze_vae, chunk=num_input_frames)
         transformer_config = pipe.transformer.config
         lr_latent, n_pad = pad_latent_frames(lr_latent, transformer_config.patch_size_t)
         batch_size, _, num_latent_frames, latent_h, latent_w = lr_latent.shape
-        log_tensor_stats(lr_latent, "LR Latent (padded)")
+        # log_tensor_stats(lr_latent, "LR Latent (padded)")
 
         prompt_embedding = resolve_prompt_embedding(
             pipe, prompt, batch_size, empty_prompt_embedding, device, dtype, prompt_cache
         )
-        log_tensor_stats(prompt_embedding, "Prompt Embedding")
+        # log_tensor_stats(prompt_embedding, "Prompt Embedding")
 
         lr_latent = lr_latent.permute(0, 2, 1, 3, 4)  # [B, T', C', H', W']
 
@@ -486,7 +487,7 @@ def forward_stage2(
                 device=device,
             )
 
-        log_tensor_stats(lr_latent, "LR Latent (DiT Input)")
+        # log_tensor_stats(lr_latent, "LR Latent (DiT Input)")
         log_memory("Before DiT Forward")
 
         with autocast_ctx(device, autocast_dtype):
@@ -497,10 +498,10 @@ def forward_stage2(
                 image_rotary_emb=rotary_emb,
                 return_dict=False,
             )[0]
-        log_tensor_stats(model_output, "DiT Output")
+        # log_tensor_stats(model_output, "DiT Output")
 
         sr_latent = pipe.scheduler.get_velocity(model_output, lr_latent, timesteps)
-        log_tensor_stats(sr_latent, "SR Latent (x0)")
+        # log_tensor_stats(sr_latent, "SR Latent (x0)")
 
         if n_pad > 0:
             sr_latent = sr_latent[:, n_pad:]
@@ -512,7 +513,7 @@ def forward_stage2(
 
         log_memory("Before VAE Decode")
         x_sr = decode_frames_independently(pipe.vae, sr_latent, scaling_factor)
-        log_tensor_stats(x_sr, "x_sr (decoded pixels, [-1,1])")
+        # log_tensor_stats(x_sr, "x_sr (decoded pixels, [-1,1])")
 
         if hr_video is not None and x_sr.shape != hr_video.shape:
             raise RuntimeError(f"Shape mismatch: reconstructed {tuple(x_sr.shape)} vs target {tuple(hr_video.shape)}")
@@ -572,6 +573,88 @@ def load_full_transformer_weights(pipe: CogVideoXPipeline, init_from: str) -> No
     del state_dict, new_state_dict
     gc.collect()
 
+def resolve_s2_adapter_dir(resume_from: str) -> str:
+    """save_pretrained(selected_adapters=["s2"]) writes to <ckpt>/s2/; also accept the s2 dir itself."""
+    for cand in (os.path.join(resume_from, "s2"), resume_from):
+        if os.path.exists(os.path.join(cand, "adapter_config.json")):
+            return cand
+    raise FileNotFoundError(f"No s2 adapter_config.json under {resume_from} (or {resume_from}/s2)")
+
+
+def build_stacked_lora(transformer, args: argparse.Namespace):
+    """W + S1 LoRA (frozen) + S2 LoRA (trainable). S2 is fresh, or restored from --resume_from."""
+    from peft import LoraConfig, PeftModel
+
+    if not (args.init_from and os.path.exists(os.path.join(args.init_from, "adapter_config.json"))):
+        raise ValueError("--train_lora needs --init_from pointing at the Stage-1 LoRA adapter dir "
+                         "(the one containing adapter_config.json).")
+
+    model = PeftModel.from_pretrained(transformer, args.init_from, adapter_name="s1", is_trainable=False)
+
+    resuming = bool(args.resume_from)
+    if resuming:
+        s2_dir = resolve_s2_adapter_dir(args.resume_from)
+        # rank/alpha/targets come from the saved adapter_config, so --lora_rank etc. are ignored here
+        model.load_adapter(s2_dir, adapter_name="s2", is_trainable=True)
+        logger.info(f"Resumed S2 LoRA weights from {s2_dir}")
+    else:
+        model.add_adapter("s2", LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.target_modules,
+            lora_dropout=0.05,
+            bias="none",
+        ))
+    model.base_model.set_adapter(["s1", "s2"])  # activates both, but also flips requires_grad on for both
+
+    for n, p in model.named_parameters():       # so re-freeze everything except s2's LoRA weights
+        p.requires_grad = ("lora_" in n) and (".s2." in n)
+
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_s1 = sum(p.numel() for n, p in model.named_parameters() if ".s1." in n)
+    b2_abs = sum(p.detach().abs().sum().item() for n, p in model.named_parameters()
+                 if "lora_B" in n and ".s2." in n)
+    logger.info(f"Stacked LoRA: active={model.base_model.active_adapters} | "
+                f"s2 trainable={n_train:,} | s1 frozen={n_s1:,} | sum|B2|={b2_abs:.1f} "
+                f"(expected {'> 0 (restored)' if resuming else '0.0 (fresh)'})")
+    assert n_train > 0, "No trainable s2 params; check the '.s2.' name filter against named_parameters()."
+    if resuming and b2_abs == 0.0:
+        logger.warning("Resumed s2 LoRA has sum|B|=0: the weights probably did not load.")
+    return model
+
+def save_checkpoint(pipe, path: str, args: argparse.Namespace,
+                    optimizer=None, lr_scheduler=None, global_step: int = 0) -> None:
+    os.makedirs(path, exist_ok=True)
+    if args.train_lora:
+        pipe.transformer.save_pretrained(path, selected_adapters=["s2"])  # -> path/s2/ (s1 is untouched, lives in --init_from)
+    elif args.use_lora:
+        pipe.transformer.save_pretrained(path)
+    else:
+        torch.save(pipe.transformer.state_dict(), os.path.join(path, "transformer.pt"))
+
+    if optimizer is not None and lr_scheduler is not None:
+        torch.save(
+            {"global_step": global_step,
+             "optimizer": optimizer.state_dict(),
+             "lr_scheduler": lr_scheduler.state_dict()},
+            os.path.join(path, "training_state.pt"),
+        )
+    logger.info(f"Saved checkpoint to {path} (step {global_step})")
+
+
+def load_training_state(path: str, optimizer, lr_scheduler) -> int:
+    """Restores optimizer + LR schedule; returns the optimizer step to continue from."""
+    state_path = os.path.join(path, "training_state.pt")
+    if not os.path.exists(state_path):
+        logger.warning(f"No training_state.pt in {path}: weights only. Optimizer and cosine schedule "
+                       "restart from step 0.")
+        return 0
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"])
+    lr_scheduler.load_state_dict(state["lr_scheduler"])
+    return int(state["global_step"])
+
+
 def setup_trainable_modules(
     pipe: CogVideoXPipeline, args: argparse.Namespace, dtype: torch.dtype
 ) -> List[torch.nn.Parameter]:
@@ -579,7 +662,9 @@ def setup_trainable_modules(
     pipe.vae.requires_grad_(False)
     pipe.vae.eval()
 
-    if args.use_lora:
+    if args.train_lora:
+        pipe.transformer = build_stacked_lora(pipe.transformer, args)
+    elif args.use_lora:
         try:
             from peft import LoraConfig, PeftModel, get_peft_model
         except ImportError as e:
@@ -603,7 +688,7 @@ def setup_trainable_modules(
         pipe.transformer.requires_grad_(True)
 
     if args.fp32_master_weights and dtype != torch.float32:
-        cast_training_params([pipe.transformer], dtype=torch.float32)
+        cast_training_params([pipe.transformer], dtype=torch.float32)  # only touches requires_grad params (s2)
         if not args.use_lora:
             logger.warning("Full fine-tune with fp32 master weights roughly doubles weight memory; "
                            "use --use_lora or --no_fp32_master_weights if you OOM.")
@@ -758,28 +843,19 @@ def build_batch_iterator(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
 def prepare_batch(batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, str]:
     """Dataset [B,T,C,H,W] in [0,1] -> model layout [B,C,T,H,W] in [-1,1], LR upsampled to HR size."""
     lr_video, hr_video, prompts = batch["lr"], batch["hr"], batch["prompt"]
-    log_tensor_stats(lr_video, "Batch LR (CPU)")
-    log_tensor_stats(hr_video, "Batch HR (CPU)")
+    # log_tensor_stats(lr_video, "Batch LR (CPU)")
+    # log_tensor_stats(hr_video, "Batch HR (CPU)")
 
     lr_video = lr_video.permute(0, 2, 1, 3, 4).contiguous() * 2.0 - 1.0
     hr_video = hr_video.permute(0, 2, 1, 3, 4).contiguous() * 2.0 - 1.0
     lr_video = spatial_upsample_video(lr_video, target_hw=(hr_video.shape[3], hr_video.shape[4]), mode="bilinear")
 
-    log_tensor_stats(lr_video, "LR Video (upsampled)")
-    log_tensor_stats(hr_video, "HR Video")
+    # log_tensor_stats(lr_video, "LR Video (upsampled)")
+    # log_tensor_stats(hr_video, "HR Video")
 
     # NOTE: only the first prompt is used for the whole batch.
     prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
     return lr_video, hr_video, prompt
-
-
-def save_checkpoint(pipe: CogVideoXPipeline, path: str, use_lora: bool) -> None:
-    os.makedirs(path, exist_ok=True)
-    if use_lora:
-        pipe.transformer.save_pretrained(path)
-    else:
-        torch.save(pipe.transformer.state_dict(), os.path.join(path, "transformer.pt"))
-    logger.info(f"Saved checkpoint to {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -811,14 +887,14 @@ def compute_losses(
 
     if not torch.isfinite(losses["total"]):
         logger.error("!!! Loss is NaN/Inf !!!")
-        log_tensor_stats(x_sr, "NaN_Loss -> x_sr", logging.ERROR)
-        log_tensor_stats(x_hr, "NaN_Loss -> x_hr", logging.ERROR)
-    log_tensor_stats(losses["total"], "Loss")
-    logger.debug(
-        f"[LOSS] total={losses['total'].item():.6f} | mse={losses['mse'].item():.6f} | "
-        f"perceptual({perceptual_fn.mode})={float(losses['perceptual']):.6f} | "
-        f"frame_diff={float(losses['frame_diff']):.6f}"
-    )
+        # log_tensor_stats(x_sr, "NaN_Loss -> x_sr", logging.ERROR)
+        # log_tensor_stats(x_hr, "NaN_Loss -> x_hr", logging.ERROR)
+    # log_tensor_stats(losses["total"], "Loss")
+    # logger.debug(
+    #     f"[LOSS] total={losses['total'].item():.6f} | mse={losses['mse'].item():.6f} | "
+    #     f"perceptual({perceptual_fn.mode})={float(losses['perceptual']):.6f} | "
+    #     f"frame_diff={float(losses['frame_diff']):.6f}"
+    # )
     return losses
 
 
@@ -836,15 +912,24 @@ def train(
 
     # The paper lists beta3=0.98 as well, but that is only consumed by
     # Prodigy-style optimizers in the reference; plain AdamW takes two betas.
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, betas=(0.9, 0.95), fused=True)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_train_steps)
 
-    running = {key: 0.0 for key in LOSS_KEYS}
     global_step = 0
+    if args.resume_from:
+        global_step = load_training_state(args.resume_from, optimizer, lr_scheduler)
+        if global_step >= args.max_train_steps:
+            logger.warning(f"Checkpoint is at step {global_step} >= max_train_steps={args.max_train_steps}; nothing to do.")
+            return
+        # reseed so the resumed run doesn't replay the same clip order / noise as the start of the first run
+        set_seed(args.seed + global_step)
+        logger.info(f"Resumed at optimizer step {global_step} | lr {lr_scheduler.get_last_lr()[0]:.2e}")
+
+    running = {key: 0.0 for key in LOSS_KEYS}
     start_time = time.time()
     optimizer.zero_grad()
 
-    progress = tqdm(range(args.max_train_steps * accum), desc="stage-2")
+    progress = tqdm(range(global_step * accum, args.max_train_steps * accum), desc="stage-2")
     for micro_step in progress:
         try:
             t_fetch = time.time()
@@ -887,12 +972,12 @@ def train(
             running = {key: 0.0 for key in LOSS_KEYS}
 
         if global_step % args.save_steps == 0:
-            save_checkpoint(pipe, os.path.join(args.output_dir, f"checkpoint-{global_step}"), args.use_lora)
+            save_checkpoint(pipe, os.path.join(args.output_dir, f"checkpoint-{global_step}"), args, optimizer, lr_scheduler, global_step)
 
         if args.val_steps > 0 and global_step % args.val_steps == 0:
             run_periodic_validation(pipe, args, global_step, autocast_dtype, empty_prompt_embedding, prompt_cache)
 
-    save_checkpoint(pipe, os.path.join(args.output_dir, "final"), args.use_lora)
+    save_checkpoint(pipe, os.path.join(args.output_dir, "final"), args, optimizer, lr_scheduler, global_step)
     logger.info(f"Training complete in {(time.time() - start_time) / 60:.1f}min.")
 
 
@@ -940,10 +1025,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=500, help="Optimizer steps (paper: 500)")
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-
     # Model
     p.add_argument("--dtype", type=str, default="bfloat16", choices=list(DTYPES))
     p.add_argument("--gradient_checkpointing", action="store_true")
+    p.add_argument("--train_lora", action="store_true")
+    p.add_argument("--resume_from", type=str, default=None,
+                help="Stage-2 checkpoint dir (e.g. stage2_ckpt/checkpoint-300) to resume --train_lora from: "
+                    "restores the s2 adapter, optimizer, LR schedule and step counter.")
     p.add_argument("--use_lora", action="store_true")
     p.add_argument("--lora_rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=64)
@@ -973,6 +1061,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_fps", type=int, default=8)
 
     args = p.parse_args()
+    if args.resume_from and not args.train_lora:
+        p.error("--resume_from is only wired up for the stacked-LoRA mode (--train_lora)")
     return args
 
 class PerceptualLossOld:
@@ -1058,11 +1148,11 @@ def main() -> None:
     logger.info(f"Loading CogVideoX pipeline from {args.model_path} ...")
     pipe = load_pipeline(args, dtype, device)
 
-    configure_tcg_module(pipe=pipe, drop_ratio=args.drop_ratio, block_intervals=args.block_intervals)
+    configure_tcg_module(pipe=pipe, drop_ratio=args.drop_ratio, block_intervals=args.block_intervals, logger=logger)
     
     trainable_params = setup_trainable_modules(pipe, args, dtype)
     if args.param_report != "none":
-        log_parameter_summary(pipe, args.use_lora, args.fp32_master_weights and dtype != torch.float32,
+        log_parameter_summary(pipe, args.use_lora or args.train_lora, args.fp32_master_weights and dtype != torch.float32,
                               detailed=args.param_report == "detailed")
 
     empty_prompt_embedding = load_empty_prompt_embedding(args.empty_prompt_embedding)
@@ -1074,11 +1164,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    dev = "cuda"
-    pred = torch.rand(2, 3, 9, 320, 640, device="cuda", requires_grad=True)
-    tgt  = torch.rand(2, 3, 9, 320, 640, device="cuda")
-    new, old = PerceptualLoss(args, dev), PerceptualLossOld(args, dev)
-    a, b = new(pred, tgt), old(pred, tgt)
-    ga, = torch.autograd.grad(a, pred); gb, = torch.autograd.grad(b, pred)
-    print(a.item(), b.item(), (ga - gb).abs().max().item())
+    main()

@@ -426,7 +426,7 @@ def load_pipeline(model_path: str, dtype: torch.dtype, device: str, args) -> Cog
     return pipe.to(device)
 
 
-def configure_tcg_module(pipe: CogVideoXPipeline, drop_ratio: float, block_intervals: List[int]) -> None:
+def configure_tcg_module(pipe: CogVideoXPipeline, drop_ratio: float, block_intervals: List[int], logger) -> None:
     """Set token-merge/unmerge layers on the transformer.
 
     Must run BEFORE the transformer is wrapped by PEFT so the attributes land
@@ -806,7 +806,7 @@ def main() -> None:
     logger.info(f"Loading CogVideoX pipeline from {args.model_path} ...")
     pipe = load_pipeline(args.model_path, dtype, device, args)
 
-    configure_tcg_module(pipe, args.drop_ratio, args.block_intervals)  # before PEFT wrapping
+    configure_tcg_module(pipe, args.drop_ratio, args.block_intervals, logger=logger)  # before PEFT wrapping
     autocast_dtype = dtype if (args.fp32_master_weights and dtype != torch.float32) else None    
     trainable_params = setup_trainable_modules(pipe, args, dtype=autocast_dtype)
     if args.param_report != "none":

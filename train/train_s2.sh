@@ -16,7 +16,7 @@ MODEL_ARGS=(
     --model_path "/home/jl_fs/DOVE/pretrained_models/DOVE"
     --dtype "bfloat16"
     --gradient_checkpointing
-    --init_from "/home/jl_fs/DOVE/checkpoints"
+    --init_from "/home/jl_fs/checkpoint/MAT-s1/checkpoint-300"
     --empty_prompt_embedding "/home/jl_fs/DOVE/pretrained_models/prompt_embeddings/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors"
     --enable_slicing
     --enable_tiling
@@ -24,6 +24,7 @@ MODEL_ARGS=(
 
 # LoRA Configuration (leave empty for full fine-tuning)
 LORA_ARGS=(
+    --train_lora
     --use_lora
     --lora_rank 512
     --lora_alpha 512
@@ -33,7 +34,7 @@ LORA_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/home/jl_fs/MajorProject_VSR/checkpoints/part2/stage_2"
+    --output_dir "/home/jl_fs/checkpoint/MAT-S2-0.42"
 )
 
 TCG_ARGS=(
@@ -44,7 +45,7 @@ TCG_ARGS=(
 # Data Configuration
 DATA_ARGS=(
     --video_dir "/home/jl_fs/train_test_dataset/HQ-VSR"
-    --num_frames 7
+    --num_frames 6
     --crop_size 320 640
     --upscale 4
     --num_workers 8
@@ -75,18 +76,18 @@ LOSS_ARGS=(
 
 # Training / Optimisation Configuration
 TRAIN_ARGS=(
-    --max_train_steps 500
-    --seed 42
+    --max_train_steps 1000
+    --seed 291749217
     --batch_size 1
-    --gradient_accumulation_steps 2
-    --learning_rate 7e-6
+    --gradient_accumulation_steps 8
+    --learning_rate 9.6e-6
     --max_grad_norm 1.0
 )
 
 # Checkpointing / Logging Configuration
 CHECKPOINT_ARGS=(
-    --save_steps 100
-    --log_steps 2
+    --save_steps 80
+    --log_steps 1
     --log_level "INFO"
     --param_report "summary"
 )
@@ -96,8 +97,12 @@ VALIDATION_ARGS=(
     --val_lr_dir "/home/jl_fs/train_test_dataset/UDM10/LQ-Video"
     --val_gt_dir "/home/jl_fs/train_test_dataset/UDM10/GT-Video"
     --val_metrics "psnr,ssim,lpips,dists"
-    --val_steps 100
+    --val_steps 50
     --val_fps 8
+)
+
+RESUME_ARGS=(
+    --resume_from "/home/jl_fs/checkpoint/MAT-S2-0.42/checkpoint-60"
 )
 
 # Combine all arguments and launch training
@@ -109,7 +114,9 @@ python -m MajorProject_VSR.train.trainS2 \
     "${DATA_ARGS[@]}" \
     "${DEGRADATION_ARGS[@]}" \
     "${SR_ARGS[@]}" \
+    "${TCG_ARGS[@]}"\
     "${LOSS_ARGS[@]}" \
+    "${RESUME_ARGS[@]}" \
     "${TRAIN_ARGS[@]}" \
     "${CHECKPOINT_ARGS[@]}" \
     "${VALIDATION_ARGS[@]}"
