@@ -187,29 +187,43 @@ def log_parameter_summary(pipe: CogVideoXPipeline, use_lora: bool, expect_fp32: 
 # --------------------------------------------------------------------------- #
 # 3. Frame-by-frame VAE encode/decode (Sec. 3.2, Eq. 5)
 # --------------------------------------------------------------------------- #
-def encode_frames_independently(vae, video: torch.Tensor, scaling_factor: float, freeze_vae: bool) -> torch.Tensor:
+def encode_frames_independently(vae, video: torch.Tensor, scaling_factor: float, freeze_vae: bool, chunk: int) -> torch.Tensor:
     """[B, C, T, H, W] in [-1, 1] -> latent [B, C', T, H', W'] (same layout as Stage-1's vae.encode)."""
     if video.ndim != 5:
         raise ValueError(f"Expected video tensor [B,C,T,H,W], got {tuple(video.shape)}")
 
-    latents = []
+    B, C, T, H, W = video.shape
+    frames = video.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)
     with torch.no_grad() if freeze_vae else torch.enable_grad():
-        for t in range(video.shape[2]):
-            frame = video[:, :, t : t + 1]
-            latents.append(vae.encode(frame).latent_dist.sample() * scaling_factor)
-    return torch.cat(latents, dim=2)
+        z = torch.cat([vae.encode(f).latent_dist.sample() for f in frames.split(T)])
+    z = z * scaling_factor                              # [B*T, C', 1, h, w]
+    return z.reshape(B, T, *z.shape[1:3], *z.shape[3:]).squeeze(3).permute(0, 2, 1, 3, 4)
+
+    # latents = []
+    # with torch.no_grad() if freeze_vae else torch.enable_grad():
+    #     for t in range(video.shape[2]):
+    #         frame = video[:, :, t : t + 1]
+    #         latents.append(vae.encode(frame).latent_dist.sample() * scaling_factor)
+    # return torch.cat(latents, dim=2)
 
 
-def decode_frames_independently(vae, latent: torch.Tensor, scaling_factor: float) -> torch.Tensor:
-    """[B, T, C', H', W'] (DiT layout) -> pixels [B, C, T, H, W] in roughly [-1, 1].
+def decode_frames_independently(vae, latent, scaling_factor, chunk=3):
+    B, T, Cl, h, w = latent.shape                       # DiT layout
+    z = (latent / scaling_factor).reshape(B * T, Cl, 1, h, w)
+    dec = lambda x: vae.decode(x).sample
+    out = torch.cat([checkpoint(dec, c, use_reentrant=False) for c in z.split(chunk)])
+    return out.reshape(B, T, *out.shape[1:2], *out.shape[3:]).permute(0, 2, 1, 3, 4)
 
-    Grad ALWAYS flows here: the decoder is on the loss path even though frozen.
-    """
-    latent = latent.permute(0, 2, 1, 3, 4) / scaling_factor  # [B, C', T, H', W']
-    dec = lambda z: vae.decode(z).sample
-    frames = [checkpoint(dec, latent[:, :, t:t+1], use_reentrant=False)
-              for t in range(latent.shape[2])]
-    return torch.cat(frames, dim=2)
+# def decode_frames_independently(vae, latent: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+#     """[B, T, C', H', W'] (DiT layout) -> pixels [B, C, T, H, W] in roughly [-1, 1].
+
+#     Grad ALWAYS flows here: the decoder is on the loss path even though frozen.
+#     """
+#     latent = latent.permute(0, 2, 1, 3, 4) / scaling_factor  # [B, C', T, H', W']
+#     dec = lambda z: vae.decode(z).sample
+#     frames = [checkpoint(dec, latent[:, :, t:t+1], use_reentrant=False)
+#               for t in range(latent.shape[2])]
+#     return torch.cat(frames, dim=2)
 
 
 def pad_latent_frames(latent: torch.Tensor, patch_size_t: Optional[int]) -> Tuple[torch.Tensor, int]:
@@ -276,7 +290,12 @@ _PERCEPTUAL_MODES = (
 
 
 class PerceptualLoss:
-    """Per-frame pyiqa loss. Edge-aware modes add metric(edge(pred), edge(gt)) and divide by 2F, else F."""
+    """Per-frame pyiqa loss, evaluated in chunks of frames.
+
+    Edge-aware modes add metric(edge(pred), edge(gt)) and divide by 2N, else N,
+    where N = B*F (number of frame samples). Chunking only changes how many
+    frames go through the metric per call, not the value.
+    """
 
     def __init__(self, args: argparse.Namespace, device: torch.device):
         self.mode: Optional[str] = None
@@ -284,6 +303,7 @@ class PerceptualLoss:
         self.metric = None
         self.edge_model: Optional[nn.Module] = None
         self.device = device
+        self.chunk_size = max(1, int(getattr(args, "num_frames", 3)))
 
         selected = None
         for weight_attr, mode, metric_name, edge_aware in _PERCEPTUAL_MODES:
@@ -306,29 +326,36 @@ class PerceptualLoss:
 
         self.metric = pyiqa.create_metric(metric_name, device=device, as_loss=True)
         self.edge_model = build_edge_model(device) if edge_aware else None
-        logger.info(f"Perceptual loss: mode={self.mode}, metric={metric_name}, weight={self.weight}")
+        logger.info(f"Perceptual loss: mode={self.mode}, metric={metric_name}, "
+                    f"weight={self.weight}, chunk_size={self.chunk_size}")
 
-    
+    def _chunk_loss(self, p: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """SUM of the metric over this chunk's samples (mean * n), so a smaller
+        last chunk is weighted correctly. .mean() also covers metrics that
+        return a scalar instead of a per-sample tensor."""
+        n = p.shape[0]
+        t = self.metric(p, g).mean()
+        if self.edge_model is not None:
+            t = t + self.metric(self.edge_model(p), self.edge_model(g)).mean()
+        return t * n
+
     def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Both [B, C, F, H, W] in [0, 1]."""
         if self.metric is None:
             return torch.zeros((), device=pred.device)
 
-        num_frames = pred.shape[2]
+        B, C, T, H, W = pred.shape
+        p_all = pred.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        g_all = target.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+
         total = 0.0
-        for f in range(num_frames):
-            p = pred[:, :, f].to(dtype=torch.float32, device=self.device)
-            g = target[:, :, f].to(dtype=torch.float32, device=self.device)
-            # .mean() is a no-op for a scalar metric and reduces a per-sample one, so backward() always gets a scalar.
-            def _frame_loss(p, g):
-                t = self.metric(p, g).mean()
-                if self.edge_model is not None:
-                    t = t + self.metric(self.edge_model(p), self.edge_model(g)).mean()
-                return t
+        for p, g in zip(p_all.split(self.chunk_size), g_all.split(self.chunk_size)):
+            p = p.to(device=self.device, dtype=torch.float32)
+            g = g.to(device=self.device, dtype=torch.float32)
+            total = total + checkpoint(self._chunk_loss, p, g, use_reentrant=False)
 
-            total = total + checkpoint(_frame_loss, p, g, use_reentrant=False)
-
-        divisor = num_frames * 2 if self.edge_model is not None else num_frames
+        n_samples = B * T
+        divisor = n_samples * 2 if self.edge_model is not None else n_samples
         return (total / divisor) * self.weight
 
 
@@ -948,6 +975,63 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     return args
 
+class PerceptualLossOld:
+    """Per-frame pyiqa loss. Edge-aware modes add metric(edge(pred), edge(gt)) and divide by 2F, else F."""
+
+    def __init__(self, args: argparse.Namespace, device: torch.device):
+        self.mode: Optional[str] = None
+        self.weight = 0.0
+        self.metric = None
+        self.edge_model: Optional[nn.Module] = None
+        self.device = device
+
+        selected = None
+        for weight_attr, mode, metric_name, edge_aware in _PERCEPTUAL_MODES:
+            weight = getattr(args, weight_attr)
+            if weight > 0:
+                selected = (mode, weight, metric_name, edge_aware)
+                break
+        if selected is None:
+            logger.warning("All perceptual weights are 0; training with MSE (+ frame-diff) only.")
+            return
+
+        self.mode, self.weight, metric_name, edge_aware = selected
+        try:
+            import pyiqa
+        except ImportError as e:
+            raise ImportError(
+                "Stage-2 needs pyiqa for the perceptual loss (`pip install pyiqa`), "
+                "or set all perceptual weights to 0."
+            ) from e
+
+        self.metric = pyiqa.create_metric(metric_name, device=device, as_loss=True)
+        self.edge_model = build_edge_model(device) if edge_aware else None
+        logger.info(f"Perceptual loss: mode={self.mode}, metric={metric_name}, weight={self.weight}")
+
+    
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Both [B, C, F, H, W] in [0, 1]."""
+        if self.metric is None:
+            return torch.zeros((), device=pred.device)
+
+        num_frames = pred.shape[2]
+        total = 0.0
+        for f in range(num_frames):
+            p = pred[:, :, f].to(dtype=torch.float32, device=self.device)
+            g = target[:, :, f].to(dtype=torch.float32, device=self.device)
+            # .mean() is a no-op for a scalar metric and reduces a per-sample one, so backward() always gets a scalar.
+            def _frame_loss(p, g):
+                t = self.metric(p, g).mean()
+                if self.edge_model is not None:
+                    t = t + self.metric(self.edge_model(p), self.edge_model(g)).mean()
+                return t
+
+            total = total + checkpoint(_frame_loss, p, g, use_reentrant=False)
+
+        divisor = num_frames * 2 if self.edge_model is not None else num_frames
+        return (total / divisor) * self.weight
+
+
 
 def main() -> None:
     args = parse_args()
@@ -990,4 +1074,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    dev = "cuda"
+    pred = torch.rand(2, 3, 9, 320, 640, device="cuda", requires_grad=True)
+    tgt  = torch.rand(2, 3, 9, 320, 640, device="cuda")
+    new, old = PerceptualLoss(args, dev), PerceptualLossOld(args, dev)
+    a, b = new(pred, tgt), old(pred, tgt)
+    ga, = torch.autograd.grad(a, pred); gb, = torch.autograd.grad(b, pred)
+    print(a.item(), b.item(), (ga - gb).abs().max().item())
