@@ -699,6 +699,10 @@ def setup_trainable_modules(
         pipe.transformer.enable_gradient_checkpointing()
         logger.info("Gradient checkpointing enabled (transformer only; VAE decoder is not checkpointed).")
 
+    for n,p in pipe.transformer.named_parameters():
+        if p.requires_grad:
+            print(f"{n}: shape={tuple(p.shape)}, requires_grad={p.requires_grad}")
+
     return [p for p in pipe.transformer.parameters() if p.requires_grad]
 
 
@@ -760,51 +764,44 @@ def make_stage2_inference_fn(
 
 
 def run_periodic_validation(
-    pipe: CogVideoXPipeline,
-    args: argparse.Namespace,
-    global_step: int,
-    autocast_dtype: Optional[torch.dtype],
-    empty_prompt_embedding: Optional[torch.Tensor],
-    prompt_cache: Dict[str, torch.Tensor],
-) -> None:
+        pipe: CogVideoXPipeline,
+        args: argparse.Namespace,
+        global_step: int,
+        autocast_dtype: Optional[torch.dtype],
+        empty_prompt_embedding: Optional[torch.Tensor],
+    ):    
     """Runs validation.validation_pred on --val_lr_dir/--val_gt_dir, if configured."""
-    if not args.val_lr_dir or not args.val_gt_dir:
-        return
-    if validation_pred is None:
-        logger.warning("validation.py (or its metric_utils dependency) not importable; skipping validation.")
-        return
-
-    inference_fn = DOVEInferenceFn(
-        pipe=pipe, 
-        upscale=4,
-        upscale_mode="bilinear",
-        noise_step=args.noise_step, 
-        sr_noise_step=args.sr_noise_step,
+    if not (args.val_lr_dir and args.val_gt_dir):
+        return    
+    fn = DOVEInferenceFn(
+        pipe=pipe, upscale=args.upscale, upscale_mode="bilinear",
+        noise_step=args.noise_step, sr_noise_step=args.sr_noise_step,
         empty_prompt_embedding=empty_prompt_embedding,
-    )   
-
+        # tile_size_hw=(320, 640), overlap_hw=(32, 32),  # optional, lower memory
+    )
+    
+    tcg_log = logging.getLogger("tcg_logger")  # use the real name from the transformer file
+    prev_level = tcg_log.level
+    tcg_log.setLevel(logging.WARNING)
     pipe.transformer.eval()
-    eval_metrics = [m.strip().lower() for m in args.val_metrics.split(",") if m.strip()]
+    torch.cuda.empty_cache()
     pred_dir = os.path.join(args.output_dir, "val_preds", f"step_{global_step}")
-
-    logger.info(f"[VALIDATION] step {global_step}: generating + scoring against {args.val_gt_dir}")
     try:
-        report = validation_pred(
-            pred_path=pred_dir,
-            gt_path=args.val_gt_dir,
-            eval_metrics=eval_metrics,
-            model=pipe.transformer,
-            lr_path=args.val_lr_dir,
-            inference_fn=inference_fn,
-            output_json=os.path.join(pred_dir, "validation_metrics.json"),
-            fps=args.val_fps,
-            overwrite_preds=True,
-        )
+        with torch.no_grad():
+            report = validation_pred(
+                pred_path=pred_dir, gt_path=args.val_gt_dir,
+                eval_metrics=[m.strip().lower() for m in args.val_metrics.split(",") if m.strip()],
+                model=pipe, lr_path=args.val_lr_dir, inference_fn=fn,
+                output_json=os.path.join(pred_dir, "validation_metrics.json"),
+                fps=args.val_fps
+            )
         logger.info(f"[VALIDATION] step {global_step}: {report['average']}")
     except Exception as e:
-        logger.error(f"[VALIDATION] step {global_step} failed: {e}")
+        logger.exception(f"[VALIDATION] step {global_step} failed: {e}")
     finally:
-        pipe.transformer.train()  # validation leaves the model in eval mode
+        pipe.transformer.train()
+        tcg_log.setLevel(prev_level)
+        torch.cuda.empty_cache()
 
 
 # --------------------------------------------------------------------------- #
@@ -897,6 +894,11 @@ def compute_losses(
     # )
     return losses
 
+@torch.no_grad()
+def lora_b_abs_sum(model) -> float:
+    ts = [p.abs().sum() for n, p in model.named_parameters()
+          if p.requires_grad and "lora_B" in n]
+    return torch.stack(ts).sum().item() if ts else float("nan")
 
 def train(
     pipe: CogVideoXPipeline,
@@ -929,6 +931,7 @@ def train(
     start_time = time.time()
     optimizer.zero_grad()
 
+    # run_periodic_validation(pipe, args, global_step, autocast_dtype, empty_prompt_embedding)
     progress = tqdm(range(global_step * accum, args.max_train_steps * accum), desc="stage-2")
     for micro_step in progress:
         try:
@@ -957,7 +960,7 @@ def train(
         optimizer.zero_grad()
         global_step += 1
         logger.debug(f"[OPT] optimizer step {global_step} (micro_step {micro_step})")
-
+        
         if global_step % args.log_steps == 0:
             n = args.log_steps * accum
             avg = {key: value / n for key, value in running.items()}
@@ -975,7 +978,7 @@ def train(
             save_checkpoint(pipe, os.path.join(args.output_dir, f"checkpoint-{global_step}"), args, optimizer, lr_scheduler, global_step)
 
         if args.val_steps > 0 and global_step % args.val_steps == 0:
-            run_periodic_validation(pipe, args, global_step, autocast_dtype, empty_prompt_embedding, prompt_cache)
+            run_periodic_validation(pipe, args, global_step, autocast_dtype, empty_prompt_embedding)
 
     save_checkpoint(pipe, os.path.join(args.output_dir, "final"), args, optimizer, lr_scheduler, global_step)
     logger.info(f"Training complete in {(time.time() - start_time) / 60:.1f}min.")

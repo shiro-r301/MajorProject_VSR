@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from MajorProject_VSR.patchTransformer import patch_CogVideoXTransformer3DModel
 patch_CogVideoXTransformer3DModel()
-
+import re
+from collections import defaultdict
 import argparse
 import logging
 import os
@@ -399,7 +400,7 @@ def run_periodic_validation(pipe, args, global_step, empty_prompt_embedding):
                 eval_metrics=[m.strip().lower() for m in args.val_metrics.split(",") if m.strip()],
                 model=pipe.transformer, lr_path=args.val_lr_dir, inference_fn=fn,
                 output_json=os.path.join(pred_dir, "validation_metrics.json"),
-                fps=args.val_fps, overwrite_preds=True,
+                fps=args.val_fps
             )
         logger.info(f"[VALIDATION] step {global_step}: {report['average']}")
     except Exception as e:
@@ -510,7 +511,10 @@ def setup_trainable_modules(
     if args.gradient_checkpointing:
         pipe.transformer.enable_gradient_checkpointing()
         logger.info("Gradient checkpointing enabled (transformer only; VAE decoder is not checkpointed).")
-
+    for n,p in pipe.transformer.named_parameters():
+        if p.requires_grad:
+            print(f"{n}: shape={tuple(p.shape)}, requires_grad={p.requires_grad}")
+    
     return [p for p in pipe.transformer.parameters() if p.requires_grad]
 
 
@@ -597,24 +601,63 @@ def compute_loss(
     log_tensor_stats(loss, "Loss")
     return loss
 
-def grad_report(module):
-    rows = {"lora_A": [], "lora_B": []}
-    for n, p in module.named_parameters():
-        if p.requires_grad and p.grad is not None:
-            k = "lora_A" if "lora_A" in n else "lora_B" if "lora_B" in n else None
-            if k:
-                rows[k].append(p.grad)
-    for k, gs in rows.items():
-        if not gs:
-            print(k, "no grads"); continue
-        numel = sum(g.numel() for g in gs)
-        zeros = sum((g == 0).sum().item() for g in gs) / numel
-        norm = torch.sqrt(sum((g.float() ** 2).sum() for g in gs)).item()
-        print(f"{k}: dtype={ {g.dtype for g in gs} } norm={norm:.3e} "
-              f"rms/param={norm/numel**0.5:.2e} zero_frac={zeros:.4f} "
-              f"nonfinite={sum((~torch.isfinite(g)).sum().item() for g in gs)}")
+LAYER_RE = re.compile(r"(?:^|\.)([A-Za-z_]*(?:blocks|layers))\.(\d+)\.")
 
-# after the final backward of the accumulation window, before optimizer.step():
+@torch.no_grad()
+def grad_report(model, step=None, tiny=1e-8, depth_thresh=1e-2, show_layers=True):
+    recs, missing = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        parts = n.split(".")
+        li = next((i for i, s in enumerate(parts) if s.startswith("lora_")), None)
+        if li is None:
+            continue
+        kind = "lora_A" if parts[li].startswith("lora_A") else "lora_B"
+        if p.grad is None:
+            missing.append(n); continue
+        m = LAYER_RE.search(n)
+        layer = (m.group(1), int(m.group(2))) if m else ("other", -1)
+        g, w = p.grad.float(), p.float()
+        recs.append((kind, layer, g.norm(), w.norm(), (g.abs() < tiny).float().mean(),
+                     torch.isfinite(g).all(), g.numel(), p.grad.dtype))
+
+    if not recs:
+        print("no LoRA grads found", f"(missing: {len(missing)})"); return
+
+    gn  = torch.stack([r[2] for r in recs]).tolist()
+    wn  = torch.stack([r[3] for r in recs]).tolist()
+    tf  = torch.stack([r[4] for r in recs]).tolist()
+    fin = torch.stack([r[5] for r in recs]).tolist()
+
+    agg = defaultdict(lambda: dict(g2=0., w2=0., tiny=0., n=0))
+    for r, g_, w_, t_ in zip(recs, gn, wn, tf):
+        a = agg[(r[0], r[1])]
+        a["g2"] += g_**2; a["w2"] += w_**2; a["tiny"] += t_ * r[6]; a["n"] += r[6]
+
+    print(f"--- step {step} | missing: {len(missing)} | nonfinite: {fin.count(False)} "
+          f"| dtypes: {sorted({str(r[7]) for r in recs})}")
+
+    for kind in ("lora_A", "lora_B"):
+        families = sorted({l[0] for (k, l) in agg if k == kind})
+        for fam in families:
+            idxs = sorted(l[1] for (k, l) in agg if k == kind and l[0] == fam)
+            norms = {i: agg[(kind, (fam, i))]["g2"] ** 0.5 for i in idxs}
+            if show_layers:
+                for i in idxs:
+                    a = agg[(kind, (fam, i))]
+                    rel = norms[i] / (a["w2"] ** 0.5 + 1e-12)
+                    print(f"{kind} {fam}[{i:>2}]: gnorm={norms[i]:.2e} rel={rel:.2e} "
+                          f"rms={norms[i]/a['n']**0.5:.2e} tiny={a['tiny']/a['n']:.3f}")
+            if len(idxs) >= 2:
+                ratio = norms[idxs[0]] / (norms[idxs[-1]] + 1e-30)
+                spread = max(norms.values()) / (min(norms.values()) + 1e-30)
+                flags = []
+                if ratio < depth_thresh: flags.append(f"VANISHING toward early (first/last={ratio:.1e})")
+                if spread > 1e3: flags.append(f"spread {spread:.0e}x")
+                print(f"  {kind}/{fam} first/last={ratio:.2e} spread={spread:.1e} "
+                      f"{'| ' + '; '.join(flags) if flags else '| ok'}")
+    # after the final backward of the accumulation window, before optimizer.step():
 
 def train(
     pipe: CogVideoXPipeline,
@@ -649,9 +692,26 @@ def train(
         for micro_step, batch in enumerate(progress):
             logger.debug(f"[DATA] micro_step {micro_step}: waited {time.time() - t_iter_end:.3f}s for batch")
             try:
+                if micro_step % 20 == 0:
+                    tr = pipe.transformer.get_base_model()   # the actual CogVideoXTransformer3DModel
+                    saved_merge, saved_unmerge = tr.merger_layers, tr.unmerger_layers
+                    try:
+                        tr.merger_layers, tr.unmerger_layers = [], []
+                        tr.merge_tokens = False
+                        with torch.no_grad():
+                            base_loss = compute_loss(pipe, batch, args, empty_prompt_embedding, freeze_vae, autocast_dtype=autocast_dtype)
+                        logger.info(f"No TokenMerge MSE: {base_loss.item():.6f}")
+                    finally:
+                        tr.merger_layers, tr.unmerger_layers = saved_merge, saved_unmerge
+                        tr.merge_tokens = True
+
                 loss = compute_loss(pipe, batch, args, empty_prompt_embedding, freeze_vae, autocast_dtype=autocast_dtype)
+                if micro_step % 20 == 0:
+                    logger.info(f"WITH TokenMerge MSE: {loss.item():.6f}")
+
                 (loss / accum).backward()
                 log_memory("After Backward")
+
             except Exception as e:
                 logger.error(f"!!! CRITICAL ERROR at micro_step {micro_step}: {e} !!!")
                 logger.error(f"Prompt(s): {batch.get('prompt')}")
@@ -814,7 +874,6 @@ def main() -> None:
 
     empty_prompt_embedding = load_empty_prompt_embedding(args.empty_prompt_embedding)
     dataloader = build_dataloader(args)
-
     train(pipe, dataloader, trainable_params, args, empty_prompt_embedding, freeze_vae, autocast_dtype=autocast_dtype)
 
 

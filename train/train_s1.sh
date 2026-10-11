@@ -11,21 +11,20 @@ MODEL_ARGS=(
     --dtype "bfloat16"  # ["float16", "bfloat16", "float32"]
     --gradient_checkpointing
     --enable_slicing
-    --init_from "/home/jl_fs/checkpoint/MAT-s1/checkpoint-750"  # dir containing transformer.pt to initialise from
 )
 
 # LoRA Configuration (leave empty for full fine-tuning)
 LORA_ARGS=(
     --use_lora
-    --lora_rank 512
-    --lora_alpha 512
+    --lora_rank 64
+    --lora_alpha 128
     --target_modules "to_q" "to_k" "to_v" "to_out.0"
     --fp32_master_weights
 )
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "checkpoint/MAT-s1"
+    --output_dir "checkpoint/MAT_S1-dr_0.42-alpha_512-r_512/"
 )
 
 # Data Configuration
@@ -40,9 +39,9 @@ DATA_ARGS=(
 
 # Degradation Configuration
 DEGRADATION_ARGS=(
-    --blur_prob 0.8
-    --noise_prob 0.5
-    --jpeg_prob 0.7
+    --blur_prob 0.4
+    --noise_prob 0.25
+    --jpeg_prob 0.35
     --video_compress_prob 0.0
 )
 
@@ -53,7 +52,7 @@ TRAIN_ARGS=(
     --seed 3114121
     --batch_size 1
     --gradient_accumulation_steps 8
-    --learning_rate 1.22e-06
+    --learning_rate 1e-4
 )
 
 VALIDATION_ARGS=(
@@ -80,7 +79,7 @@ TCG_ARGS=(
 
 # Checkpointing / Logging Configuration
 CHECKPOINT_ARGS=(
-    --save_steps 150  # save checkpoint every x steps
+    --save_steps 100  # save checkpoint every x steps
     --log_steps 1
     --log_level "INFO"  # ["DEBUG", "INFO", "WARNING"]; DEBUG adds per-tensor stats (slower)
     --param_report "summary"  # ["none", "summary", "detailed"]
