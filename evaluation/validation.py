@@ -38,7 +38,7 @@ Usage:
 """
 
 from __future__ import annotations
-
+import os, sys
 import json
 import logging
 import zlib
@@ -54,8 +54,12 @@ decord.bridge.set_bridge("torch")
 
 import imageio.v3 as iio
 import pyiqa
+from peft import LoraConfig, PeftModel
 
 from MajorProject_VSR.evaluation.metric_utils import evaluate_video_metrics
+from transformers import AutoTokenizer, T5EncoderModel
+from diffusers import CogVideoXDPMScheduler, CogVideoXPipeline
+import gc
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +69,7 @@ logging.basicConfig(
 logger = logging.getLogger("validation")
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
 # --------------------------------------------------------------------------- #
@@ -287,3 +292,186 @@ def validation_pred(
         logger.info(f"Saved report to {output_json}")
 
     return report
+
+def parse_args():
+    import argparse
+
+    p = argparse.ArgumentParser(description="Video-SR validation (DOVE / CogVideoX)")
+    # data
+    p.add_argument("--lr_path", required=True, help="Dir of LR videos")
+    p.add_argument("--gt_path", required=True, help="Dir of GT videos")
+    p.add_argument("--pred_path", default=None, help="Where to write preview videos")
+    p.add_argument("--output_json", default=None)
+    # model
+    p.add_argument("--model_path", required=True, help="DOVE / CogVideoX checkpoint dir")
+    p.add_argument("--load_s1", default=None, help="Dir with S1 weights (<dir>/S1/ or <dir>/)")
+    p.add_argument("--load_s2", default=None, help="Dir with S2 weights (<dir>/S2/ or <dir>/)")
+    p.add_argument("--empty_prompt_embedding", default=None, help="Precomputed .pt (skips T5)")
+    p.add_argument("--dtype", default="bf16", choices=list(DTYPES))
+    # inference
+    p.add_argument("--upscale", type=int, default=4)
+    p.add_argument("--noise_step", type=int, default=0)
+    p.add_argument("--sr_noise_step", type=int, default=399)
+    p.add_argument("--tile_size_hw", type=int, nargs=2, default=None, metavar=("H", "W"))
+    p.add_argument("--overlap_hw", type=int, nargs=2, default=(32, 32), metavar=("H", "W"))
+
+    p.add_argument("--drop_ratio", type=float, default=0.35)
+    p.add_argument("--block_intervals", type=int, nargs="+", default=[20, 25, 32, 37])
+
+    # metrics / protocol
+    p.add_argument("--metrics", nargs="+", default=["psnr", "ssim", "lpips", "dists"])
+    p.add_argument("--crop", type=int, default=0)
+    p.add_argument("--test_y_channel", action="store_true")
+    p.add_argument("--batch_mode", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no_quantize_8bit", action="store_true")
+    p.add_argument("--no_save_preds", action="store_true")
+    p.add_argument("--fps", type=int, default=8)
+    return p.parse_args()
+
+
+def configure_tcg_module(pipe: CogVideoXPipeline, drop_ratio: float, block_intervals: List[int], logger) -> None:
+    """Set token-merge/unmerge layers on the transformer.
+
+    Must run BEFORE the transformer is wrapped by PEFT so the attributes land
+    on the base module whose forward reads them.
+    """
+    intervals = sorted(block_intervals)
+    pipe.transformer.tcg.drop_ratio = drop_ratio
+    pipe.transformer.merger_layers = intervals[::2]
+    pipe.transformer.unmerger_layers = intervals[1::2]
+    logger.info(f"TCG MODULE CONFIGURATIONS:- Drop Ratio: {pipe.transformer.tcg.drop_ratio}, \
+                Merge Intervals: {pipe.transformer.merger_layers}, Unmerger Intervals: {pipe.transformer.unmerger_layers} \
+                Mode: {'TEMPORAL' if pipe.transformer.tcg.use_temporal_grouping else 'SPATIAL'}")
+
+def _find_in_stage(root: str, stage: str, filename: str) -> Optional[str]:
+    """First existing <root>/<stage>/<filename> or <root>/<filename>, else None."""
+    for cand in (os.path.join(root, stage, filename), os.path.join(root, filename)):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def load_full_transformer_weights(pipe: CogVideoXPipeline, ckpt_path: str) -> None:
+    logger.info(f"Loading full transformer weights from {ckpt_path}")
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    state = {k.removeprefix("module."): v for k, v in state.items()}  # strip DDP prefix
+    pipe.transformer.load_state_dict(state, strict=True)  # raises on any mismatch
+    del state
+
+
+def load_stage_weights(pipe: CogVideoXPipeline, path: str, stage: str) -> None:
+    """Load a LoRA adapter (merged in) or a full transformer.pt for the given stage."""
+    adapter_cfg = _find_in_stage(path, stage, "adapter_config.json")
+    if adapter_cfg is not None:
+        adapter_dir = os.path.dirname(adapter_cfg)
+        logger.info(f"Loading {stage} LoRA from {adapter_dir}")
+        peft_model = PeftModel.from_pretrained(pipe.transformer, adapter_dir, is_trainable=False)
+        # Merge so the transformer is a plain module again: stages stack cleanly
+        pipe.transformer = peft_model.merge_and_unload()
+        return
+
+    ckpt = _find_in_stage(path, stage, "transformer.pt")
+    if ckpt is not None:
+        load_full_transformer_weights(pipe, ckpt)
+        return
+
+    raise FileNotFoundError(
+        f"No adapter_config.json or transformer.pt for {stage} under {path} "
+        f"(looked in {path}/{stage}/ and {path}/)"
+    )
+
+
+def load_pipe(args, device: torch.device) -> CogVideoXPipeline:
+    pipe = CogVideoXPipeline.from_pretrained(
+        args.model_path,
+        tokenizer=None,
+        text_encoder=None,
+        torch_dtype=DTYPES[args.dtype],
+    )
+    pipe.to(device)
+
+    for path, stage in ((args.load_s1, "S1"), (args.load_s2, "S2")):
+        if path:
+            load_stage_weights(pipe, path, stage)
+
+    pipe.transformer.requires_grad_(False)
+    pipe.transformer.eval()
+    return pipe
+
+@torch.no_grad()
+def build_empty_prompt_embedding(args, device: torch.device) -> torch.Tensor:
+    """Empty-prompt T5 embedding. T5 is loaded temporarily and freed afterwards."""
+    dtype = DTYPES[args.dtype]
+    if args.empty_prompt_embedding:
+        return torch.load(args.empty_prompt_embedding, map_location=device, weights_only=True).to(dtype)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, subfolder="tokenizer")
+    text_encoder = (
+        T5EncoderModel.from_pretrained(args.model_path, subfolder="text_encoder", torch_dtype=dtype)
+        .to(device)
+        .eval()
+    )
+    ids = tokenizer(
+        "",
+        padding="max_length",
+        max_length=226,  # must match the value used when training
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    ).input_ids.to(device)
+    embeds = text_encoder(ids)[0].to(dtype)
+
+    del text_encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return embeds
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    from MajorProject_VSR.inference import DOVEInferenceFn
+    pipe = load_pipe(args, device)
+    empty_prompt_embedding = build_empty_prompt_embedding(args, device)
+    configure_tcg_module(pipe=pipe, drop_ratio=args.drop_ratio, block_intervals=args.block_intervals, logger=logger)
+
+    fn_kwargs = {}
+    if args.tile_size_hw is not None:
+        fn_kwargs.update(tile_size_hw=tuple(args.tile_size_hw), overlap_hw=tuple(args.overlap_hw))
+
+    fn = DOVEInferenceFn(
+        pipe=pipe,
+        upscale=args.upscale,
+        upscale_mode="bilinear",
+        noise_step=args.noise_step,
+        sr_noise_step=args.sr_noise_step,
+        empty_prompt_embedding=empty_prompt_embedding,
+        **fn_kwargs,
+    )
+
+    metric_models = build_metric_models(args.metrics, device)
+
+    report = validation_pred(
+        model=pipe,  # NOT pipe.transformer: validation_pred accesses model.transformer / model.vae
+        inference_fn=fn,
+        lr_path=args.lr_path,
+        gt_path=args.gt_path,
+        pred_path=args.pred_path,
+        eval_metrics=args.metrics,
+        metric_models=metric_models,
+        device=device,
+        output_json=args.output_json,
+        crop=args.crop,
+        test_y_channel=args.test_y_channel,
+        batch_mode=args.batch_mode,
+        seed=args.seed,
+        quantize_8bit=not args.no_quantize_8bit,
+        save_preds=not args.no_save_preds,
+        fps=args.fps,
+    )
+
+    print(json.dumps(report["average"], indent=2))
+
+if __name__ == "__main__":
+    main()

@@ -718,51 +718,6 @@ def load_empty_prompt_embedding(path: str) -> Optional[torch.Tensor]:
 # --------------------------------------------------------------------------- #
 # 7. Validation bridge (validation.py)
 # --------------------------------------------------------------------------- #
-def make_stage2_inference_fn(
-    pipe: CogVideoXPipeline,
-    args: argparse.Namespace,
-    autocast_dtype: Optional[torch.dtype],
-    empty_prompt_embedding: Optional[torch.Tensor],
-    prompt_cache: Dict[str, torch.Tensor],
-) -> Callable:
-    """Builds `inference_fn(model, lr_video, device) -> pred_video` for validation.generate_sr_videos.
-
-    lr_video / pred_video: [F, C, H, W] float32 in [0, 1]. The `model` argument
-    is ignored: inference runs the real Stage-2 forward pass through `pipe`, so
-    it matches training exactly (same noise / prompt settings).
-    """
-
-    def inference_fn(model, lr_video: torch.Tensor, device: torch.device) -> torch.Tensor:
-        lr = lr_video.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()  # [1, C, F, H, W]
-        lr = (lr * 2.0 - 1.0).to(device)
-        _, _, _, h, w = lr.shape
-        lr = spatial_upsample_video(lr, target_hw=(h * args.upscale, w * args.upscale), mode="bilinear")
-
-        was_training = pipe.transformer.training
-        pipe.transformer.eval()
-        try:
-            with torch.no_grad():
-                x_sr, _ = forward_stage2(
-                    pipe=pipe,
-                    lr_video=lr,
-                    hr_video=None,
-                    prompt="",
-                    noise_step=args.noise_step,
-                    sr_noise_step=args.sr_noise_step,
-                    empty_prompt_embedding=empty_prompt_embedding,
-                    freeze_vae=FREEZE_VAE,
-                    autocast_dtype=autocast_dtype,
-                    prompt_cache=prompt_cache,
-                )
-        finally:
-            if was_training:
-                pipe.transformer.train()
-
-        return to_unit_range(x_sr).squeeze(0).permute(1, 0, 2, 3).contiguous()  # [F, C, H, W]
-
-    return inference_fn
-
-
 def run_periodic_validation(
         pipe: CogVideoXPipeline,
         args: argparse.Namespace,
