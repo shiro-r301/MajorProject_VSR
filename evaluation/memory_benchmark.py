@@ -1043,6 +1043,30 @@ def _block_ranges(block_bytes: List[int]) -> str:
             start = i
     return " | ".join(out)
 
+def _find_base(rows: List[dict], r: dict) -> Optional[dict]:
+    return next((b for b in rows if b["frames"] == r["frames"] and b["is_baseline"]
+                 and b["status"] == "ok"), None)
+
+
+def _pct(x, base) -> str:
+    return f"{(x - base) / base * 100:+8.1f}%" if x is not None and base else "        -"
+
+
+def _avg_stats(r: dict, merged_ids: set) -> dict:
+    """Averages over blocks. 'merged' = only the blocks that run on the merged sequence.
+    The same ids are used for the baseline row, so the comparison is layer-for-layer."""
+    out = {}
+    own = r.get("attn_layers_own")                     # per-layer attention own memory (bytes)
+    if own:
+        out["attn_own_mean"] = statistics.fmean(own)
+        m = [v for i, v in enumerate(own) if i in merged_ids]
+        out["attn_own_merged_mean"] = statistics.fmean(m) if m else None
+    if r.get("blocks"):                                # needs --mem_per_block
+        act = [b - r["base_alloc"] for b in r["blocks"]]   # per-block peak minus weights
+        out["blk_act_mean"] = statistics.fmean(act)
+        m = [v for i, v in enumerate(act) if i in merged_ids]
+        out["blk_act_merged_mean"] = statistics.fmean(m) if m else None
+    return out
 
 def log_memory_table(rows: List[dict], base_gib: float, total_gib: float) -> None:
     g = lambda x: f"{x / GIB:8.2f}" if x is not None else "     n/a"
@@ -1050,14 +1074,12 @@ def log_memory_table(rows: List[dict], base_gib: float, total_gib: float) -> Non
             f"{'attn_pk':>8}{'attn_own':>9}{'sdpa_ws':>9}{'time_s':>8}{'speedup':>9}")
     lines = [f"weights/static = {base_gib:.2f} GiB | GPU total = {total_gib:.1f} GiB "
              f"(GiB, except sdpa_ws in MiB) | TRANSFORMER FORWARD ONLY", head]
-    find_base = lambda r: next((b for b in rows if b["frames"] == r["frames"] and b["is_baseline"]
-                                and b["status"] == "ok"), None)
     for r in rows:
         if r["status"] != "ok":
             lines.append(f"{r['config']:<22}{r['frames']:>7}  {r['status']}")
             continue
-        base = find_base(r)
-        d_act = f"{(r['act'] - base['act']) / base['act'] * 100:+8.1f}%" if base and base["act"] else "        -"
+        base = _find_base(rows, r)
+        d_act = _pct(r["act"], base["act"]) if base else "        -"
         spd = f"{base['time'] / r['time']:8.2f}x" if base else "        -"
         ws = max((v["workspace"] for v in _attn_recs(r)), default=None)
         ws_s = f"{ws / 2**20:9.0f}" if ws is not None else "      n/a"
@@ -1069,13 +1091,32 @@ def log_memory_table(rows: List[dict], base_gib: float, total_gib: float) -> Non
     logger.info("Memory profile:\n" + "\n".join(lines))
 
     for r in rows:
-        base = find_base(r)
+        base = _find_base(rows, r)
         if r["status"] != "ok" or r["is_baseline"] or base is None:
             continue
-        o_red = (1 - r["act"] / base["act"]) * 100 if base["act"] > 0 else float("nan")
-        a_red = (1 - r["attn_own"] / base["attn_own"]) * 100 if r.get("attn_own") and base.get("attn_own") else None
-        attn_txt = f" | worst-layer attention memory {-a_red:+.1f}%" if a_red is not None else ""
-        logger.info(f"{r['config']} @ {r['frames']}f: transformer activations {-o_red:+.1f}%{attn_txt}")
+        parts = [f"peak {_pct(r['peak_alloc'], base['peak_alloc']).strip()}"]
+        for key, name in (("attn_own_merged_mean", "merged-layer attention"),
+                          ("blk_act_merged_mean", "merged-block activations"),
+                          ("blk_act_mean", "mean block activations")):
+            if r.get(key) is not None and base.get(key):
+                parts.append(f"{name} {_pct(r[key], base[key]).strip()}")
+        logger.info(f"{r['config']} @ {r['frames']}f: " + " | ".join(parts))
+    
+def log_avg_table(rows: List[dict]) -> None:
+    gi = lambda x: f"{x / GIB:10.3f}" if x is not None else "       n/a"
+    head = (f"{'config':<22}{'frames':>7}{'attn_mean':>10}{'d':>9}{'attn_mrg':>10}{'d':>9}"
+            f"{'blk_mean':>10}{'d':>9}{'blk_mrg':>10}{'d':>9}")
+    lines = ["Average memory over blocks (GiB). attn = attention own memory, blk = per-block peak minus weights; "
+             "mrg = blocks that run merged only", head]
+    for r in rows:
+        if r["status"] != "ok":
+            continue
+        b = _find_base(rows, r) or {}
+        cells = [f"{r['config']:<22}{r['frames']:>7}"]
+        for key in ("attn_own_mean", "attn_own_merged_mean", "blk_act_mean", "blk_act_merged_mean"):
+            cells.append(gi(r.get(key)) + _pct(r.get(key), b.get(key)))
+        lines.append("".join(cells))
+    logger.info("\n".join(lines))
 
 
 def run_memory_mode(args, pipe, empty_prompt_embedding, device: torch.device, env: dict) -> dict:
@@ -1086,6 +1127,9 @@ def run_memory_mode(args, pipe, empty_prompt_embedding, device: torch.device, en
     configs = ([] if args.mem_no_baseline else [("baseline (no merge)", None)]) + [
         (f"drop={r:g}", r) for r in args.mem_drop_ratios
     ]
+
+    mi = sorted(args.block_intervals)
+    merged_ids = {i for a, b in zip(mi[::2], mi[1::2]) for i in range(a + 1, b + 1)}  # e.g. 15-21, 33-39
 
     # The VAE is never run here. Moving it off the GPU keeps its weights out of the reported peak.
     pipe.vae.to("cpu")
@@ -1120,6 +1164,9 @@ def run_memory_mode(args, pipe, empty_prompt_embedding, device: torch.device, en
                                    args.mem_per_block, args.seed)
             row.update(config=label, drop_ratio=ratio, frames=frames, tokens=tokens,
                        latent_shape=shape, is_baseline=ratio is None)
+            if row["status"] == "ok":
+                row.update(_avg_stats(row, merged_ids))
+            
             rows.append(row)
             if row["status"] != "ok":
                 continue
@@ -1148,7 +1195,7 @@ def run_memory_mode(args, pipe, empty_prompt_embedding, device: torch.device, en
     ok = [r for r in rows if r["status"] == "ok"]
     base_gib = ok[0]["base_alloc"] / GIB if ok else 0.0
     log_memory_table(rows, base_gib, total_gib)
-
+    log_avg_table(rows)
     report = {"rows": rows, "gpu": props.name, "gpu_total_gib": round(total_gib, 2),
               "env": env, "args": vars(args)}
     if args.output_json:

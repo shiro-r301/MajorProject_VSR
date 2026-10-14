@@ -21,7 +21,9 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
 from diffusers.utils.logging import get_logger
 
+
 logger = get_logger(__name__)
+TCG_DEBUG = "1"
 
 from math import floor
 
@@ -61,11 +63,12 @@ def setup_tcg_logging(log_file="tcg_execution.log"):
 
 # Initialize the global logger for this file
 tcg_logger = setup_tcg_logging()
-
+tcg_logger.setLevel(logging.INFO if TCG_DEBUG else logging.WARNING)
 
 class TemporalCurvatureGuidance(torch.nn.Module):
     def __init__(self, patch_size_t: int = 2, use_temporal_grouping: bool = True):
         super().__init__()
+        self.debug = TCG_DEBUG
         self.p_t = patch_size_t
         self.Fg = None  
         self.Hg = None  
@@ -85,49 +88,24 @@ class TemporalCurvatureGuidance(torch.nn.Module):
             tcg_logger.info(f"[Grid] Set TCG Grid -> Fg: {self.Fg}, Hg: {self.Hg}, Wg: {self.Wg} (Total: {Fg*Hg*Wg})")
  
     def _check_grid(self, N: int, context: str):
-        """Cheap but meaningful sanity check: catches BOTH non-divisibility
-        (loud crash, safe) and — for anyone auditing logs — surfaces the
-        Fg/P actually being used so a wrong-but-divisible Fg is at least
-        visible in the log stream even though it can't be auto-detected
-        from N alone."""
         if self.Fg is None:
-            raise RuntimeError(
-                f"[{context}] self.Fg is None — set_frame_count() was not called "
-                f"before this forward pass. Refusing to guess a grid."
-            )
+            raise RuntimeError(f"[{context}] self.Fg is None: set_grid_dimensions() was not called")
         if N % self.Fg != 0:
-            raise ValueError(
-                f"[{context}] Token count {N} is not divisible by Fg={self.Fg}. "
-                f"This usually means set_frame_count() was called with the wrong "
-                f"num_frames, or patch_embed's actual token layout doesn't match "
-                f"the floor/ceil division assumed here."
-            )
-        P = N // self.Fg
-        tcg_logger.info(f"[{context}] Grid check OK: N={N}, Fg={self.Fg}, P={P}")
-        return P
-
+            raise ValueError(f"[{context}] Token count {N} is not divisible by Fg={self.Fg}")
+        return N // self.Fg                      
     def temporal_errors(self, X):
-        B, P, C = X.shape
-        tcg_logger.info(f"[Scoring] Input shape: {X.shape} | Frames: {self.Fg} | Patch_t: {self.p_t}")
-
-        Xf = X.reshape([B, self.Fg, self.Wg * self.Hg, C]).to(dtype=torch.float32)
-        velocity = Xf[:, 1:, :, :] - Xf[:, :-1, :, :]
+        B, N, C = X.shape
+        Xf = X.reshape(B, self.Fg, self.Wg * self.Hg, C).float()
+        velocity = Xf[:, 1:] - Xf[:, :-1]
+        del Xf
         v_norms = velocity.norm(dim=-1)
-        vf_n = velocity[:, 1:, :, :]
-        vf = velocity[:, :-1, :, :]
-        num = (vf_n * vf).sum(dim=-1)
-
-        cos_theta = num / (v_norms[:, 1:, :] * v_norms[:, :-1, :] + self.ep)
-        cos_theta = cos_theta.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        curv = torch.arccos(cos_theta)
-        pad_curv = self.fill_edges(curv)
-
+        num = torch.linalg.vecdot(velocity[:, 1:], velocity[:, :-1], dim=-1)   # no (a*b) temporary
+        del velocity
+        cos_theta = (num / (v_norms[:, 1:] * v_norms[:, :-1] + self.ep)).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        pad_curv = self.fill_edges(torch.arccos(cos_theta))
         s_min = pad_curv.amin(dim=-1, keepdim=True)
         s_max = pad_curv.amax(dim=-1, keepdim=True)
-        s_tcg = (pad_curv - s_min) / (s_max - s_min + self.ep)
-
-        tcg_logger.info(f"[Scoring] Curvature Min: {s_min.shape}, {s_min.dtype}, {Xf.shape}, {pad_curv.shape} | Max: {s_max.mean().item():.4f}")
-        return s_tcg
+        return (pad_curv - s_min) / (s_max - s_min + self.ep)     # no .item()
 
     def fill_edges(self, curvature):
         start = curvature[:, 0:1, :]
@@ -191,34 +169,20 @@ class TemporalCurvatureGuidance(torch.nn.Module):
             "P": P,
         }
 
-    def get_token_set(self, tokens, s):
-        """
-        Batch-vectorized: tokens [B,N,C], s [B,N]. k (number kept) and
-        Mr=N-k (number dropped) are constants that only depend on N and
-        drop_ratio, so every row in the batch keeps/drops the same COUNT of
-        tokens — just not the same ones, since s (the curvature score)
-        differs per sample. That's what makes this batchable without any
-        padding at this stage (padding only becomes necessary later, in
-        temporal_group_tokens, where the *number of touched spatial
-        positions* genuinely varies per sample).
-        """
+    def get_token_set(self, tokens, s, need_dropped: bool = False):
+        """Dr is only gathered when the legacy (non-temporal) merge needs it."""
         B, N, C = tokens.shape
         k = max(1, N - floor(self.drop_ratio * N))
-        topk = torch.topk(s, k=k, dim=-1)
-        kept_idx, _ = torch.sort(topk.indices, dim=-1)  # [B, k] ascending
-
+        kept_idx = torch.sort(torch.topk(s, k=k, dim=-1).indices, dim=-1).values   # [B, k] ascending
         keep_mask = torch.zeros(B, N, dtype=torch.bool, device=tokens.device)
         keep_mask.scatter_(1, kept_idx, True)
-        mask = ~keep_mask  # True = dropped
-
+        mask = ~keep_mask                                                         # True = dropped
         Hr = torch.gather(tokens, 1, kept_idx.unsqueeze(-1).expand(-1, -1, C))
-
-        Mr = N - k
-        dropped_idx = self._extract_indices(mask, Mr)
-        Dr = torch.gather(tokens, 1, dropped_idx.unsqueeze(-1).expand(-1, -1, C))
-
-        tcg_logger.info(f"[Split] Total: {N} | Kept (Local): {k} | Dropped: {N-k} | Batch: {B}")
-        return Hr, k, Dr, mask, kept_idx  # kept, how many kept, dropped, drop_mask, kept original positions
+        Dr = None
+        if need_dropped:
+            dropped_idx = self._extract_indices(mask, N - k)
+            Dr = torch.gather(tokens, 1, dropped_idx.unsqueeze(-1).expand(-1, -1, C))
+        return Hr, k, Dr, mask, kept_idx
 
     def get_even_splits(self, Mr, Gr):
         base = Mr // Gr
@@ -251,153 +215,63 @@ class TemporalCurvatureGuidance(torch.nn.Module):
         tcg_logger.info(f"[Merge] Dropped Tokens: {Mr} | Groups: {Gr} | Final Global Tokens: {H_global.shape[1]}")
         return H_global
 
-    def temporal_group_tokens(self, tokens: torch.Tensor, mask: torch.Tensor, pack: dict = None):
-        """
-        Batch-vectorized. Which spatial positions have >=1 dropped frame
-        (and therefore produce a "global" summary token) depends on each
-        sample's own curvature scores, so the COUNT of global tokens can
-        differ per batch element. We pack each row's real global tokens
-        first and pad the rest with exact-zero tokens out to the batch max
-        (`pack["max_valid"]`), and return `pad_mask` so the caller can feed
-        an attention mask that ignores the padding — the padding never
-        participates in attention and is discarded again by
-        `identity_restore` in any case.
-
-        tokens: [B, N, C]   mask: [B, N] bool (True = dropped)
-        pack: optional pre-computed `_pack_positions(mask)` result — pass
-        the SAME pack into `get_rope_for_merged_tokens_temporal` so the
-        global-token ordering/padding for tokens and RoPE stay aligned.
-        Returns (H_global [B, max_valid, C], pad_mask [B, max_valid] bool, pack).
-        """
+    def temporal_group_tokens(self, tokens, mask, pack=None):
         B, N, C = tokens.shape
         if pack is None:
             pack = self._pack_positions(mask)
-
-        Mr = int(mask.sum(dim=1).max().item())
-        if pack["max_valid"] == 0:
-            tcg_logger.info("[TemporalGroup] No dropped tokens in any sample; returning empty global set.")
+        mv = pack["max_valid"]
+        if mv == 0:
             return tokens.new_zeros(B, 0, C), pack["pad_mask"], pack
 
-        P = pack["P"]
-        tok_grid = tokens.view(B, self.Fg, P, C)
+        tok_grid = tokens.view(B, self.Fg, pack["P"], C)
+        masked = tok_grid.masked_fill(~pack["mask_grid"].unsqueeze(-1), 0.0)
+        mean_tokens = masked.sum(dim=1) / pack["mask_sum"].unsqueeze(-1).clamp(min=1).to(tokens.dtype)
+        del masked
+        order = pack["order"][:, :mv]                                  # gather only the rows we keep
+        H_global = torch.gather(mean_tokens, 1, order.unsqueeze(-1).expand(-1, -1, C))
 
-        # 1. Zero out un-dropped tokens
-        mask_expanded = pack["mask_grid"].unsqueeze(-1)
-        masked_tok_grid = tok_grid.masked_fill(~mask_expanded, 0.0)
-
-        # 2. Sum over temporal dimension and divide by per-position count
-        sum_tokens = masked_tok_grid.sum(dim=1)  # [B, P, C]
-        mean_tokens = sum_tokens / pack["mask_sum"].unsqueeze(-1).clamp(min=1).to(tokens.dtype)
-
-        # 3. Pack valid positions first (per row), pad the rest with zeros
-        gathered = torch.gather(mean_tokens, 1, pack["order"].unsqueeze(-1).expand(-1, -1, C))
-        H_global = gathered[:, : pack["max_valid"], :]
-
-        # ---------------------------------------------------------
-        # Logging & Invariant Checks (Vectorized, per-sample)
-        # ---------------------------------------------------------
-        total_grouped_per_row = pack["mask_sum"].sum(dim=1)  # [B]
-        dropped_per_row = mask.sum(dim=1)                    # [B]
-        if not torch.equal(total_grouped_per_row, dropped_per_row):
-            raise RuntimeError(
-                f"[TemporalGroup] Grouped token counts {total_grouped_per_row.tolist()} != "
-                f"dropped token counts {dropped_per_row.tolist()}. Tokens are being lost or "
-                f"double-counted during grouping."
-            )
-
-        fully_dropped_positions = int((pack["mask_sum"] == self.Fg).sum().item())
-        if fully_dropped_positions > 0:
-            tcg_logger.warning(
-                f"[TemporalGroup] {fully_dropped_positions} (sample, spatial-position) pair(s) "
-                f"had ALL {self.Fg} frames dropped — those pixels have zero individually "
-                f"preserved frames this interval, fully collapsed to one summary token."
-            )
-
-        tcg_logger.info(
-            f"[TemporalGroup] Batch: {B} | Dropped Tokens/sample (max): {Mr} | "
-            f"Spatial positions touched per sample: {pack['counts'].tolist()}/{P} | "
-            f"Final Global Tokens (padded): {H_global.shape[1]}"
-        )
-
+        if self.debug:                                                 # these two force GPU syncs
+            if not torch.equal(pack["mask_sum"].sum(dim=1), mask.sum(dim=1)):
+                raise RuntimeError("[TemporalGroup] grouped token count != dropped token count")
+            full = int((pack["mask_sum"] == self.Fg).sum().item())
+            tcg_logger.info(f"[TemporalGroup] touched={pack['counts'].tolist()}/{pack['P']} "
+                            f"global={H_global.shape[1]} fully_dropped_positions={full}")
         return H_global, pack["pad_mask"], pack
 
-    def get_rope_for_merged_tokens_temporal(self, cos: torch.Tensor, sin: torch.Tensor, mask: torch.Tensor, k: int, pack: dict):
-        """
-        Batch-vectorized. `cos`/`sin` are the batch-independent rotary
-        table (shape [N, D], or [1, N, D] — RoPE only depends on the
-        (frame, spatial) grid, not on video content, so it is never
-        batched itself). What *is* per-sample is which absolute positions
-        got kept vs. dropped, so `local_cos`/`local_sin` (RoPE for the kept
-        tokens) and the merged "global" RoPE both need a per-row gather.
 
-        mask: [B, N] bool (True=dropped). k: number of kept tokens (constant
-        across the batch). pack: the SAME dict returned by
-        `_pack_positions(mask)` / used in `temporal_group_tokens`, so the
-        global RoPE rows line up with H_global's rows (including padding).
-
-        Returns final_cos, final_sin: [B, k + max_valid, D] (or with a
-        leading dim of 1 preserved, matching the input's dimensionality).
-        Padding rows are exact-zero — harmless, since those positions are
-        also excluded from attention via pack["pad_mask"].
-        """
-        squeeze_needed = False
+    def get_rope_for_merged_tokens_temporal(self, cos, sin, mask, k, pack, kept_idx=None):
         if cos.dim() == 3:
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-            squeeze_needed = True
-
+            cos, sin = cos.squeeze(0), sin.squeeze(0)
         B, N = mask.shape
-        D = cos.shape[-1]
-        P = pack["P"]
+        D, P, mv = cos.shape[-1], pack["P"], pack["max_valid"]
+        if kept_idx is None:
+            kept_idx = self._extract_indices(~mask, k)
+        local_cos, local_sin = cos[kept_idx], sin[kept_idx]            # [B, k, D]; table is batch-independent
 
-        keep_mask = ~mask
-        kept_idx = self._extract_indices(keep_mask, k)  # [B, k] ascending
+        if mv == 0:
+            return local_cos, local_sin
 
-        cos_b = cos.unsqueeze(0).expand(B, N, D)
-        sin_b = sin.unsqueeze(0).expand(B, N, D)
-        local_cos = torch.gather(cos_b, 1, kept_idx.unsqueeze(-1).expand(-1, -1, D))
-        local_sin = torch.gather(sin_b, 1, kept_idx.unsqueeze(-1).expand(-1, -1, D))
+        m = pack["mask_grid"].unsqueeze(-1)
+        cos_g = cos.view(self.Fg, P, D).unsqueeze(0).expand(B, -1, -1, -1).masked_fill(~m, 0.0)
+        sin_g = sin.view(self.Fg, P, D).unsqueeze(0).expand(B, -1, -1, -1).masked_fill(~m, 0.0)
+        cnt = pack["mask_sum"].unsqueeze(-1).clamp(min=1).to(cos.dtype)
+        g_cos, g_sin = cos_g.sum(dim=1) / cnt, sin_g.sum(dim=1) / cnt
+        norm = torch.sqrt(g_cos**2 + g_sin**2 + self.ep)
+        g_cos, g_sin = g_cos / norm, g_sin / norm
 
-        if pack["max_valid"] == 0:
-            final_cos, final_sin = local_cos, local_sin
-        else:
-            cos_grid = cos.view(self.Fg, P, D).unsqueeze(0).expand(B, self.Fg, P, D)
-            sin_grid = sin.view(self.Fg, P, D).unsqueeze(0).expand(B, self.Fg, P, D)
-            mask_expanded = pack["mask_grid"].unsqueeze(-1)
-            masked_cos = cos_grid.masked_fill(~mask_expanded, 0.0)
-            masked_sin = sin_grid.masked_fill(~mask_expanded, 0.0)
+        order = pack["order"][:, :mv].unsqueeze(-1).expand(-1, -1, D)
+        pad = pack["pad_mask"].unsqueeze(-1)
+        global_cos = torch.gather(g_cos, 1, order) * pad.to(g_cos.dtype)
+        global_sin = torch.gather(g_sin, 1, order) * pad.to(g_sin.dtype)
+        return torch.cat([local_cos, global_cos], dim=1), torch.cat([local_sin, global_sin], dim=1)
 
-            mask_sum_clamped = pack["mask_sum"].unsqueeze(-1).clamp(min=1).to(cos.dtype)
-            g_cos_all = masked_cos.sum(dim=1) / mask_sum_clamped  # [B, P, D]
-            g_sin_all = masked_sin.sum(dim=1) / mask_sum_clamped
-
-            norm = torch.sqrt(g_cos_all**2 + g_sin_all**2 + self.ep)
-            g_cos_all = g_cos_all / norm
-            g_sin_all = g_sin_all / norm
-
-            gathered_cos = torch.gather(g_cos_all, 1, pack["order"].unsqueeze(-1).expand(-1, -1, D))
-            gathered_sin = torch.gather(g_sin_all, 1, pack["order"].unsqueeze(-1).expand(-1, -1, D))
-            global_cos = gathered_cos[:, : pack["max_valid"], :]
-            global_sin = gathered_sin[:, : pack["max_valid"], :]
-
-            # Zero out padding rows explicitly (dtype/precision-safe; they're
-            # already ~0 from the masked mean at untouched positions).
-            pad = pack["pad_mask"].unsqueeze(-1)
-            global_cos = global_cos * pad.to(global_cos.dtype)
-            global_sin = global_sin * pad.to(global_sin.dtype)
-
-            final_cos = torch.cat([local_cos, global_cos], dim=1)
-            final_sin = torch.cat([local_sin, global_sin], dim=1)
-
-        # NOTE: unlike the old batch=1 version, final_cos/final_sin are
-        # already rank-3 [B, seq, D] at this point (that's the whole point
-        # of batching them) — `squeeze_needed` only tells us the *input*
-        # table had a redundant leading dim of 1, there's nothing left to
-        # "restore" it to.
-        del squeeze_needed
-        tcg_logger.info(f"[RoPE] Mapped RoPE to temporally-grouped sequence (batched). New shape: {final_cos.shape}")
-
-        return final_cos, final_sin
+    def identity_restore(self, original_tokens, merged_tokens, k, kept_idx):
+        B, N, D = original_tokens.shape
+        idx = kept_idx.unsqueeze(-1).expand(-1, -1, D)
+        src = merged_tokens[:, :k, :].to(original_tokens.dtype)
+        if torch.is_grad_enabled():
+            return torch.scatter(original_tokens, 1, idx, src)          # autograd-safe
+        return original_tokens.scatter_(1, idx, src)                    
     
     def get_rope_for_merged_tokens(self, cos: torch.Tensor, sin: torch.Tensor, tokens: torch.Tensor, mask: torch.Tensor):
         """Reference RoPE merge (contiguous splits). Kept for A/B comparison
@@ -453,29 +327,6 @@ class TemporalCurvatureGuidance(torch.nn.Module):
 
         tcg_logger.info(f"[RoPE] Mapped RoPE to reduced sequence. New shape: {final_cos.shape}")
         return final_cos, final_sin
-
-    def identity_restore(self, original_tokens: torch.Tensor, merged_tokens: torch.Tensor, k: int, kept_idx: torch.Tensor) -> torch.Tensor:
-        """
-        Batch-vectorized. Which absolute positions were "kept" (and
-        therefore need their updated values scattered back) differs per
-        sample, so this takes `kept_idx` ([B, k] ascending original
-        positions, as returned by `get_token_set`) rather than a single
-        boolean mask shared across the batch — a plain boolean-mask
-        assignment (`restored[:, keep_mask, :] = ...`) only works when the
-        mask is identical for every row, which isn't true once batch>1
-        samples can each drop different tokens. The padded "global" tokens
-        in `merged_tokens[:, k:, :]` are simply not used here — they were
-        already folded into the kept tokens' updates by attention, and are
-        discarded once the local tokens are restored to their original
-        positions.
-        """
-        B, N, D = original_tokens.shape
-        idx = kept_idx.unsqueeze(-1).expand(-1, -1, D)
-        src = merged_tokens[:, :k, :].to(dtype=original_tokens.dtype)
-
-        restored = torch.scatter(original_tokens, 1, idx, src)   # new tensor, autograd-safe
-        tcg_logger.info(f"[Restore] Restored sequence length to {N} for batch {B}. Kept tokens updated.")
-        return restored
 
     # ------------------------------------------------------------------
     # TRaM-VSR CHANGE: temporal grouping
@@ -905,6 +756,40 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
 
         self.set_attn_processor(FusedCogVideoXAttnProcessor2_0())
 
+    def _merge(self, hidden_states, image_rotary_emb, text_seq_length, base_attention_kwargs):
+        """All large temporaries (H_local, Dr, H_global, scores, pack) die when this returns."""
+        tcg = self.tcg
+        temporal = tcg.use_temporal_grouping
+        s = tcg.temporal_errors(hidden_states)
+        H_local, k, Dr, mask, kept_idx = tcg.get_token_set(hidden_states, s, need_dropped=not temporal)
+        del s
+        cos, sin = image_rotary_emb
+        attn_kwargs = base_attention_kwargs
+
+        if temporal:
+            pack = tcg._pack_positions(mask)
+            H_global, pad_mask, pack = tcg.temporal_group_tokens(hidden_states, mask, pack=pack)
+            merged = torch.cat([H_local, H_global], dim=1)
+            new_cos, new_sin = tcg.get_rope_for_merged_tokens_temporal(cos, sin, mask, k, pack, kept_idx=kept_idx)
+            B = merged.shape[0]
+            if B == 1:
+                # No padding is possible, so a mask would be all-True. Passing one anyway
+                # disables flash SDPA. Use the same 2-D rope layout as the unmerged layers.
+                new_cos, new_sin = new_cos[0], new_sin[0]
+            elif not bool((pack["counts"] == pack["max_valid"]).all()):   # padding exists (B>1 only)
+                ok = torch.ones(B, text_seq_length + k, dtype=torch.bool, device=merged.device)
+                attn_kwargs = {**(base_attention_kwargs or {}), "attention_mask": torch.cat([ok, pad_mask], dim=1)}
+        else:
+            H_global = tcg.mean_global_tokens(Dr)
+            merged = torch.cat([H_local, H_global], dim=1)
+            new_cos, new_sin = tcg.get_rope_for_merged_tokens(cos=cos, sin=sin, tokens=hidden_states, mask=mask)
+
+        rope_len = new_cos.shape[-2]
+        if rope_len != merged.shape[1]:
+            raise RuntimeError(f"[Merge] RoPE length {rope_len} != token length {merged.shape[1]}")
+        state = {"tokens": hidden_states, "rope": image_rotary_emb, "kept_idx": kept_idx, "k": k}
+        return merged, (new_cos, new_sin), attn_kwargs, state
+
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.unfuse_qkv_projections
     def unfuse_qkv_projections(self):
         """Disables the fused QKV projection if enabled.
@@ -989,25 +874,21 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
 
-        # 3. Transformer blocks
-        original_rope = None
-        original_tokens = None
-        mask = None
-        kept_idx = None
-        k = 0
+                # 3. Transformer blocks
         base_attention_kwargs = attention_kwargs
         active_attention_kwargs = attention_kwargs
+        merge_state = None
+        merge_at = set(self.merger_layers or [])
+        unmerge_at = set(self.unmerger_layers or [])
 
-        if hidden_states.is_cuda:
-            torch.cuda.synchronize() # Ensure previous GPU ops are finished
+        timing = self.tcg.debug and hidden_states.is_cuda      # no forced syncs in normal runs
+        if timing:
+            torch.cuda.synchronize()
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-        else:
-            start_time = time.perf_counter() # Fallback for CPU inference
 
         for i, block in enumerate(self.transformer_blocks):
-
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, emb, image_rotary_emb, active_attention_kwargs,
@@ -1018,121 +899,28 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
                     temb=emb, image_rotary_emb=image_rotary_emb, attention_kwargs=active_attention_kwargs,
                 )
 
-            # --- MERGER INJECTION ---
-            if self.merger_layers is not None and i in self.merger_layers:
-                try:
-                    tcg_logger.info(f"--- MERGE TRIGGERED AT LAYER {i} (batch={hidden_states.shape[0]}) ---")
-                    original_tokens = hidden_states
-                    original_rope = image_rotary_emb
+            if i in merge_at:
+                hidden_states, image_rotary_emb, active_attention_kwargs, merge_state = self._merge(
+                    hidden_states, image_rotary_emb, text_seq_length, base_attention_kwargs
+                )
 
-                    s_tcg = self.tcg.temporal_errors(hidden_states)
-                    H_local, k, Dr, mask, kept_idx = self.tcg.get_token_set(hidden_states, s_tcg)
-                    cos, sin = image_rotary_emb
+            if i in unmerge_at:
+                if merge_state is None:
+                    raise RuntimeError(f"unmerge layer {i} reached with no active merge")
+                hidden_states = self.tcg.identity_restore(
+                    merge_state["tokens"], hidden_states, merge_state["k"], merge_state["kept_idx"]
+                )
+                image_rotary_emb = merge_state["rope"]
+                active_attention_kwargs = base_attention_kwargs
+                merge_state = None
 
-                    if self.tcg.use_temporal_grouping:
-                        tcg_logger.info(f"[LOG] MERGING IN TEMPORAL DIMENSION")
-                        # TRaM-VSR CHANGE: position-aware temporal grouping
-                        # instead of an arbitrary contiguous split of Dr.
-                        # Batched: which spatial positions get a "global"
-                        # token can differ per sample, so H_global is padded
-                        # to the batch max and `global_pad_mask` marks which
-                        # slots are real.
-                        pack = self.tcg._pack_positions(mask)
-                        H_global, global_pad_mask, pack = self.tcg.temporal_group_tokens(hidden_states, mask, pack=pack)
-                        hidden_states = torch.cat([H_local, H_global], dim=1)
-                        image_rotary_emb = self.tcg.get_rope_for_merged_tokens_temporal(
-                            cos=cos, sin=sin, mask=mask, k=k, pack=pack
-                        )
-
-                        # Build the attention mask for the merged region: text
-                        # tokens (unchanged, all real) + k local tokens (all
-                        # real) + padded global tokens (real per global_pad_mask).
-                        B = hidden_states.shape[0]
-                        text_ok = torch.ones(B, text_seq_length, dtype=torch.bool, device=hidden_states.device)
-                        local_ok = torch.ones(B, k, dtype=torch.bool, device=hidden_states.device)
-                        merge_attn_mask = torch.cat([text_ok, local_ok, global_pad_mask], dim=1)
-                        merged_kwargs = dict(base_attention_kwargs or {})
-                        merged_kwargs["attention_mask"] = merge_attn_mask
-                        active_attention_kwargs = merged_kwargs
-
-                        if global_pad_mask.numel() > 0 and not bool(global_pad_mask.all()):
-                            tcg_logger.info(
-                                f"[Merge] Padded global tokens to batch max "
-                                f"({global_pad_mask.shape[1]}); per-sample real counts: "
-                                f"{global_pad_mask.sum(dim=1).tolist()}"
-                            )
-
-                    else:
-                        tcg_logger.info(f"[LOG] MERGING IN SPATIAL DIMENSION")
-                        H_global = self.tcg.mean_global_tokens(Dr)
-                        hidden_states = torch.cat([H_local, H_global], dim=1)
-                        image_rotary_emb = self.tcg.get_rope_for_merged_tokens(
-                            cos=cos, sin=sin, tokens=original_tokens, mask=mask
-                        )
-                        # No padding in this (batch=1-only) fallback path — no attention mask needed.
-                    expected_len = H_local.shape[1] + H_global.shape[1]
-                    if hidden_states.shape[1] != expected_len:
-                        raise RuntimeError(f"[Merge] H_work length {hidden_states.shape[1]} != "
-                                            f"H_local+H_global ({expected_len})")
-                    cos_chk, sin_chk = image_rotary_emb
-                    rope_len = cos_chk.shape[-2] if cos_chk.dim() == 3 else cos_chk.shape[0]
-                    if rope_len != hidden_states.shape[1]:
-                        raise RuntimeError(f"[Merge] RoPE length {rope_len} != token length "
-                                            f"{hidden_states.shape[1]} — attention will silently "
-                                            f"misapply rotary embeddings if this ever passes unchecked.")
-                    tcg_logger.info(f"[Merge] Post-merge check OK: {hidden_states.shape[1]} tokens, "
-                                    f"RoPE length {rope_len} matches.")
-
-                    tcg_logger.info(f"--- MERGE COMPLETE. New Hidden States Shape: {hidden_states.shape} ---")
-                except Exception as e:
-                    # Logs the exact error and traceback to the text file!
-                    tcg_logger.exception(f"CRITICAL ERROR during MERGE at layer {i}: {str(e)}")
-                    raise e  # Re-raise so the program still halts
-
-            # --- UNMERGER INJECTION ---
-            if self.unmerger_layers is not None and i in self.unmerger_layers:
-                try:
-                    tcg_logger.info(f"--- UNMERGE TRIGGERED AT LAYER {i} ---")
-                    if self.tcg.use_temporal_grouping:
-                        hidden_states = self.tcg.identity_restore(
-                            original_tokens=original_tokens,
-                            merged_tokens=hidden_states,
-                            k=k,
-                            kept_idx=kept_idx,
-                        )
-                    else:
-                        # Legacy batch=1-only path still keyed off the boolean mask.
-                        hidden_states = self.tcg.identity_restore(
-                            original_tokens=original_tokens,
-                            merged_tokens=hidden_states,
-                            k=k,
-                            kept_idx=self.tcg._extract_indices(~mask, k),
-                        )
-                    image_rotary_emb = original_rope
-                    active_attention_kwargs = base_attention_kwargs
-
-                    original_rope = None
-                    original_tokens = None
-                    mask = None
-                    kept_idx = None
-                    k = 0
-                    tcg_logger.info(f"--- UNMERGE COMPLETE. Restored Hidden States Shape: {hidden_states.shape} ---")
-                except Exception as e:
-                    tcg_logger.exception(f"CRITICAL ERROR during UNMERGE at layer {i}: {str(e)}")
-                    raise e
-        if hidden_states.is_cuda:
+        if timing:
             end_event.record()
-            torch.cuda.synchronize() # Wait for all 42 blocks to finish
-            block_inference_time = start_event.elapsed_time(end_event) / 1000.0  # Convert ms to seconds
-        else:
-            block_inference_time = time.perf_counter() - start_time
-            
-        tcg_logger.info(
-            f"[Timing] Total inference time for all {len(self.transformer_blocks)} transformer blocks (incl. TCG overhead): "
-            f"{block_inference_time:.4f} seconds"
-        )
-        hidden_states = self.norm_final(hidden_states)
+            torch.cuda.synchronize()
+            tcg_logger.info(f"[Timing] {len(self.transformer_blocks)} blocks incl. TCG: "
+                            f"{start_event.elapsed_time(end_event) / 1000.0:.4f} s")
 
+        hidden_states = self.norm_final(hidden_states)
         # 4. Final block
         hidden_states = self.norm_out(hidden_states, temb=emb)
         hidden_states = self.proj_out(hidden_states)
