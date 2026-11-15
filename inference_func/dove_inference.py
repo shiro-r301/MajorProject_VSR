@@ -497,7 +497,7 @@ def process_video(
     noise_step: int = 0,
     sr_noise_step: int = 399,
     empty_prompt_embedding: torch.Tensor = None,
-    compute_dtype = torch.float16
+    compute_dtype = torch.bfloat16
 ):
     # SR the video frames based on the prompt.
     # `num_frames` is the Number of frames to generate.
